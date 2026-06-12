@@ -1,9 +1,11 @@
 {
   "mcpServers": {
     "dap-debugger": {
-      "command": "go",
-      "args": ["run", "."],
-      "cwd": "${CLAUDE_PLUGIN_ROOT}"
+      "command": "bash",
+      "args": [
+        "-c",
+        "cd \"$CLAUDE_PLUGIN_ROOT\" && go build -o bin/mcp-dap-server . >&2 && exec bin/mcp-dap-server"
+      ]
     }
   }
 }
