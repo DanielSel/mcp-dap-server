@@ -219,6 +219,18 @@ Check what's available after starting a session: the tool list updates automatic
 
 Only one tool can read from the DAP connection at a time. Do not call multiple tools concurrently in the same session — call them sequentially.
 
+### Continue/step never block forever
+
+`continue` and `step` wait for the program to stop, but only up to `timeoutSeconds`
+(default 10). DAP delivers the stop asynchronously, so a breakpoint that never
+binds — or a program that simply keeps running — would otherwise hang the call
+(and the session) indefinitely. On timeout the program is **paused** and its
+current location returned ("Still running … paused at `<file:line>`"). This is
+expected on live/remote systems: inspect with `context`, or call `continue`
+again (optionally with a larger `timeoutSeconds`) to keep waiting. Note that
+while a program is running you cannot inspect it — DAP only exposes the stack
+and variables once it is stopped, which is why the timeout pauses it for you.
+
 ---
 
 ## MCP Prompts

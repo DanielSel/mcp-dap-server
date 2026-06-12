@@ -127,15 +127,20 @@ Remove breakpoints from a file or clear all breakpoints.
 Continue program execution. Optionally run to a specific location.
 - **Parameters**:
   - `to` (object, optional): Run-to-cursor target (file+line or function)
+  - `timeoutSeconds` (number, optional): Max seconds to wait for a stop before pausing and returning control (default 10)
 
-Returns full context when stopped.
+Returns a stop summary when stopped. If the program does not reach a breakpoint
+within `timeoutSeconds`, it is paused and its current location is returned
+("Still running … paused") instead of blocking — useful for live/remote systems
+where a breakpoint may never hit. Call `continue` again to keep running.
 
 #### `step`
 Step through code execution.
 - **Parameters**:
   - `mode` (string, required): One of 'over', 'in', or 'out'
+  - `timeoutSeconds` (number, optional): Max seconds to wait for the step to complete before pausing and returning control (default 10)
 
-Returns full context at new location.
+Returns the new location when the step completes.
 
 #### `pause`
 Pause program execution.

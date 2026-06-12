@@ -3,12 +3,21 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"sync"
+	"time"
 
 	"github.com/google/go-dap"
 )
+
+// errReadTimeout is returned by ReadMessageWithTimeout when no message arrives
+// before the deadline. The blocking read itself is never interrupted: the
+// background reader keeps the next complete message buffered for the following
+// read, so no data is lost.
+var errReadTimeout = errors.New("dap: read timed out")
 
 // readWriteCloser combines separate reader and writer into io.ReadWriteCloser.
 type readWriteCloser struct {
@@ -22,17 +31,37 @@ type readWriteCloser struct {
 // sequence number of the sent request, which callers use to match
 // the corresponding response via request_seq.
 type DAPClient struct {
-	rwc       io.ReadWriteCloser
-	reader    *bufio.Reader
-	logWriter io.Writer
+	rwc    io.ReadWriteCloser
+	reader *bufio.Reader
 	// seq tracks the sequence number for each request sent to the server.
 	seq int
+
+	logMu     sync.Mutex
+	logWriter io.Writer
+
+	// recvCh carries complete messages from the background reader (readLoop)
+	// to callers. Decoupling the blocking read from callers lets them apply a
+	// timeout without ever interrupting a read mid-message.
+	recvCh chan readResult
 }
+
+// readResult is a single decoded message or the error that ended the stream.
+type readResult struct {
+	msg dap.Message
+	err error
+}
+
+// dialTimeout bounds the TCP connect to a (possibly remote) DAP server so a
+// black-holed address cannot hang the debug tool indefinitely.
+const dialTimeout = 10 * time.Second
+
+// initializeTimeout bounds the wait for the adapter's initialize response.
+const initializeTimeout = 30 * time.Second
 
 // newDAPClient creates a new Client over a TCP connection.
 // Call Close to close the connection.
 func newDAPClient(addr string) (*DAPClient, error) {
-	conn, err := net.Dial("tcp", addr)
+	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to DAP server at %s: %w", addr, err)
 	}
@@ -42,21 +71,52 @@ func newDAPClient(addr string) (*DAPClient, error) {
 // newDAPClientFromRWC creates a new Client with the given ReadWriteCloser.
 // Call Close to close the underlying transport.
 func newDAPClientFromRWC(rwc io.ReadWriteCloser) *DAPClient {
-	return &DAPClient{
+	c := &DAPClient{
 		rwc:    rwc,
 		reader: bufio.NewReader(rwc),
 		seq:    1, // match VS Code numbering
+		recvCh: make(chan readResult, 16),
 	}
+	go c.readLoop()
+	return c
 }
 
-// Close closes the client connection.
+// Close closes the client connection. This unblocks the background reader,
+// which exits once the failed read surfaces on recvCh.
 func (c *DAPClient) Close() {
 	c.rwc.Close()
 }
 
 // SetProtocolLogger sets a writer for logging all DAP messages sent and received.
 func (c *DAPClient) SetProtocolLogger(w io.Writer) {
+	c.logMu.Lock()
 	c.logWriter = w
+	c.logMu.Unlock()
+}
+
+// readLoop reads complete DAP messages off the wire and forwards them on
+// recvCh. Running the blocking read in its own goroutine lets callers apply a
+// timeout (see ReadMessageWithTimeout) without interrupting a read
+// mid-message, which would desynchronize the stream. It exits after the first
+// read error (e.g. once Close shuts the transport down).
+func (c *DAPClient) readLoop() {
+	for {
+		msg, err := dap.ReadProtocolMessage(c.reader)
+		if err == nil {
+			c.logMu.Lock()
+			w := c.logWriter
+			c.logMu.Unlock()
+			if w != nil {
+				if data, merr := json.Marshal(msg); merr == nil {
+					fmt.Fprintf(w, "RECV: <<<%s>>>\n", data)
+				}
+			}
+		}
+		c.recvCh <- readResult{msg: msg, err: err}
+		if err != nil {
+			return
+		}
+	}
 }
 
 // InitializeRequest sends an 'initialize' request and returns the server's capabilities.
@@ -76,9 +136,13 @@ func (c *DAPClient) InitializeRequest(adapterID string) (dap.Capabilities, error
 	if err := c.send(request); err != nil {
 		return dap.Capabilities{}, err
 	}
+	deadline := time.Now().Add(initializeTimeout)
 	for {
-		msg, err := c.ReadMessage()
+		msg, err := c.ReadMessageWithTimeout(time.Until(deadline))
 		if err != nil {
+			if errors.Is(err, errReadTimeout) {
+				return dap.Capabilities{}, fmt.Errorf("timed out after %s waiting for initialize response", initializeTimeout)
+			}
 			return dap.Capabilities{}, err
 		}
 		switch resp := msg.(type) {
@@ -96,17 +160,36 @@ func (c *DAPClient) InitializeRequest(adapterID string) (dap.Capabilities, error
 	}
 }
 
+// ReadMessage returns the next DAP message, blocking until one is available
+// or the stream ends.
 func (c *DAPClient) ReadMessage() (dap.Message, error) {
-	msg, err := dap.ReadProtocolMessage(c.reader)
-	if err != nil {
-		return nil, err
-	}
-	if c.logWriter != nil {
-		if data, merr := json.Marshal(msg); merr == nil {
-			fmt.Fprintf(c.logWriter, "RECV: <<<%s>>>\n", data)
+	r := <-c.recvCh
+	return r.msg, r.err
+}
+
+// ReadMessageWithTimeout returns the next DAP message, or errReadTimeout if
+// none arrives within d. On timeout the next message stays queued for a
+// subsequent read, so no data is lost. A non-positive d means the deadline has
+// already passed: it polls without blocking and returns errReadTimeout if no
+// message is immediately available. It therefore never blocks indefinitely,
+// even when a caller computes a remaining duration that has gone negative.
+func (c *DAPClient) ReadMessageWithTimeout(d time.Duration) (dap.Message, error) {
+	if d <= 0 {
+		select {
+		case r := <-c.recvCh:
+			return r.msg, r.err
+		default:
+			return nil, errReadTimeout
 		}
 	}
-	return msg, nil
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case r := <-c.recvCh:
+		return r.msg, r.err
+	case <-t.C:
+		return nil, errReadTimeout
+	}
 }
 
 // LaunchRequest sends a 'launch' request with the specified args.
@@ -151,11 +234,22 @@ func (c *DAPClient) newRequest(command string) *dap.Request {
 	return request
 }
 
+// writeTimeout bounds a single request write. A sub-KB DAP write essentially
+// never blocks, but a live-but-unresponsive peer (e.g. a wedged port-forward
+// whose receive window has gone to zero) could in theory stall it forever. On a
+// TCP transport we cap it with a write deadline; a timed-out write leaves the
+// stream unusable, so the error is fatal to the session (the caller tears it
+// down). Stdio transports (gdb) have no remote peer and are left unbounded.
+const writeTimeout = 10 * time.Second
+
 func (c *DAPClient) send(request dap.Message) error {
 	if c.logWriter != nil {
 		if data, err := json.Marshal(request); err == nil {
 			fmt.Fprintf(c.logWriter, "SENT: <<<%s>>>\n", data)
 		}
+	}
+	if conn, ok := c.rwc.(net.Conn); ok {
+		conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	}
 	return dap.WriteProtocolMessage(c.rwc, request)
 }

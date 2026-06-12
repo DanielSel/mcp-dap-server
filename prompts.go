@@ -143,6 +143,12 @@ Expected: Stops at your breakpoint. Output includes:
 - **Stack trace**: full call chain
 - **Variables**: locals and their current values
 
+`+"`"+`continue`+"`"+` waits up to `+"`"+`timeoutSeconds`+"`"+` (default 10) for a stop, then **pauses
+the program** and returns "Still running … paused" instead of blocking forever.
+That's a normal checkpoint, not an error — call `+"`"+`continue()`+"`"+` again to keep going,
+or use a shorter budget like `+"`"+`continue(timeoutSeconds=3)`+"`"+`. You can only inspect
+while the program is stopped, never while it runs.
+
 **What to look for:**
 - Are variable values what you expect at this point?
 - Is the call stack reasonable, or is something unexpected calling this function?
@@ -283,6 +289,12 @@ Only set breakpoints if you have a specific hypothesis to test.
 Call: `+"`"+`breakpoint(function="packageName.FunctionName")`+"`"+`
 
 Then resume: `+"`"+`continue()`+"`"+`
+
+`+"`"+`continue`+"`"+` waits up to `+"`"+`timeoutSeconds`+"`"+` (default 10) for the breakpoint, then
+**pauses the process** and returns "Still running … paused" rather than blocking.
+For an attached (possibly production) process that pause **freezes it for all
+users until you continue again** — so use a short budget and resume promptly:
+`+"`"+`continue(timeoutSeconds=3)`+"`"+`, inspect, then `+"`"+`continue()`+"`"+` again.
 
 The process resumes and runs until your breakpoint is hit. Inspect state at that point.
 
@@ -569,6 +581,11 @@ When you see a branch or call you want to understand:
 2. Set a breakpoint there and `+"`"+`continue()`+"`"+`
 3. Inspect register/memory state at that point
 
+> `+"`"+`continue`+"`"+` waits up to `+"`"+`timeoutSeconds`+"`"+` (default 10), then **pauses** and
+> returns "Still running … paused" instead of blocking. If an address breakpoint
+> never binds (wrong address, code path not taken) you get that paused summary,
+> not a hang — fix the address and continue again. Inspect only while stopped.
+
 **Common patterns:**
 - `+"`"+`call malloc`+"`"+` → memory allocation; check return in rax for NULL
 - `+"`"+`test rax, rax; je`+"`"+` → null check
@@ -701,6 +718,13 @@ the `+"`"+`File:`+"`"+` path shown by `+"`"+`context()`+"`"+` and adjust `+"`"+`
 Call: `+"`"+`continue()`+"`"+`, then `+"`"+`context()`+"`"+`, `+"`"+`evaluate(...)`+"`"+`, and
 `+"`"+`step(...)`+"`"+` exactly as in a local session — the full tool surface works
 identically over the remote connection.
+
+On a live service the breakpoint may not hit immediately. `+"`"+`continue`+"`"+` waits up to
+`+"`"+`timeoutSeconds`+"`"+` (default 10), then **pauses** and returns "Still running …
+paused" rather than blocking. Keep the budget short and **loop**: trigger the
+request that exercises the breakpoint (curl the endpoint, send the message),
+`+"`"+`continue(timeoutSeconds=5)`+"`"+`, inspect, repeat. Reaching for a huge timeout just
+blinds you — you can only inspect while the program is stopped.
 
 ---
 

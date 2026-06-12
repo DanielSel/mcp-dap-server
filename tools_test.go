@@ -1583,6 +1583,39 @@ func TestPause(t *testing.T) {
 	ts.stopDebugger(t)
 }
 
+// TestContinueTimeout verifies that continue does not block forever when the
+// program never reaches a breakpoint: after the timeout it pauses the program
+// and returns its location instead of hanging the session.
+func TestContinueTimeout(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "loop")
+	defer cleanupBinary()
+
+	// No breakpoints: the program loops forever and never stops on its own.
+	ts.startDebugSession(t, "0", binaryPath, nil)
+
+	// Continue with a short timeout. Without the timeout this call would block
+	// indefinitely; instead it should pause and report that it is still running.
+	text, isErr := ts.callTool(t, "continue", map[string]any{"timeoutSeconds": 1})
+	if isErr {
+		t.Fatalf("continue returned error: %s", text)
+	}
+	if !strings.Contains(text, "Still running") {
+		t.Errorf("Expected 'Still running' after timeout, got:\n%s", text)
+	}
+	t.Logf("Continue timeout result:\n%s", text)
+
+	// The session must still be usable: the program is paused, so context works.
+	contextStr := ts.getContextContent(t)
+	if !strings.Contains(contextStr, "loop") {
+		t.Errorf("Expected context in loop program after timeout-pause, got:\n%s", contextStr)
+	}
+
+	ts.stopDebugger(t)
+}
+
 func TestStepIn(t *testing.T) {
 	ts := setupMCPServerAndClient(t)
 	defer ts.cleanup()

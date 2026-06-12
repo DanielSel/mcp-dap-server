@@ -91,6 +91,13 @@ Then run to the breakpoint:
 continue()
 ```
 
+`continue` waits up to `timeoutSeconds` (default 10) for the breakpoint to hit,
+then **pauses** and returns `Still running … paused at <addr>` instead of
+blocking. If your address breakpoint never binds (wrong address, code path not
+taken), you'll get that paused summary rather than a hang — fix the address and
+`continue` again, optionally with a shorter budget: `continue(timeoutSeconds=3)`.
+You can only inspect registers/memory while stopped, never while running.
+
 ### 5. Inspect registers and memory
 
 **x86-64 registers:**

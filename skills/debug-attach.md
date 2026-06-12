@@ -24,6 +24,26 @@ Before starting, gather:
 
 ---
 
+## Execution waits are bounded — and a timeout pauses the process
+
+`continue` and `step` wrap an asynchronous protocol in a synchronous call: they
+wait up to `timeoutSeconds` (default 10) for the next stop, then **pause the
+process** and return `Still running … paused at <file:line>` rather than ever
+blocking. For an **attached** process this has a real cost: a timeout leaves the
+process **paused**, which in production freezes it for all users until you
+`continue` again.
+
+- Use **short** timeouts and resume promptly. To wait for a breakpoint that may
+  not hit soon, keep the budget small and loop: `continue(timeoutSeconds=3)`,
+  inspect, decide, resume — minimizing the window the process is frozen.
+- You can only inspect (`context`, `evaluate`, `info`) while the process is
+  **stopped** — never while it runs. The pause is what makes inspection possible.
+- A `timed out … waiting for response` *error* (distinct from the paused summary)
+  means the adapter is unresponsive — `stop(detach=true)` and reattach rather
+  than retrying blindly.
+
+---
+
 ## Step-by-Step Workflow
 
 ### 1. Attach to the process

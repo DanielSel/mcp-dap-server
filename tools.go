@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/go-dap"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -261,9 +262,10 @@ type ContextParams struct {
 
 // StepParams defines the parameters for stepping through code.
 type StepParams struct {
-	Mode        string  `json:"mode" mcp:"'over' (next line), 'in' (into function), 'out' (out of function)"`
-	ThreadID    FlexInt `json:"threadId,omitempty" mcp:"thread to step (default: current thread)"`
-	FullContext bool    `json:"fullContext,omitempty" mcp:"if true, return full context (stack trace and variables) when stopped; if false (default), return a compact stop summary — leave false unless you need variables immediately"`
+	Mode           string  `json:"mode" mcp:"'over' (next line), 'in' (into function), 'out' (out of function)"`
+	ThreadID       FlexInt `json:"threadId,omitempty" mcp:"thread to step (default: current thread)"`
+	FullContext    bool    `json:"fullContext,omitempty" mcp:"if true, return full context (stack trace and variables) when stopped; if false (default), return a compact stop summary — leave false unless you need variables immediately"`
+	TimeoutSeconds FlexInt `json:"timeoutSeconds,omitempty" mcp:"max seconds to wait for the step to complete before pausing and returning control (default 10); guards against a step that never returns (e.g. stepping over a blocking call)"`
 }
 
 // InfoParams defines parameters for getting program metadata.
@@ -278,13 +280,25 @@ type BreakpointToolParams struct {
 	Function string  `json:"function,omitempty" mcp:"function name (alternative to file+line)"`
 }
 
+// defaultResponseTimeout bounds how long the synchronous request/response
+// helpers wait for a matching reply. These are control-plane operations
+// (set breakpoints, fetch scopes/variables, evaluate, etc.) that normally
+// answer in milliseconds; the bound only exists so an unresponsive adapter or a
+// wedged connection can never hang a tool call indefinitely.
+const defaultResponseTimeout = 30 * time.Second
+
 // readAndValidateResponse reads DAP messages until it receives the response
 // matching requestSeq. Out-of-order responses (different request_seq) and
-// events are skipped. Returns an error if the matched response indicates failure.
+// events are skipped. Returns an error if the matched response indicates
+// failure, or if no matching response arrives within defaultResponseTimeout.
 func readAndValidateResponse(client *DAPClient, requestSeq int, errorPrefix string) error {
+	deadline := time.Now().Add(defaultResponseTimeout)
 	for {
-		msg, err := client.ReadMessage()
+		msg, err := client.ReadMessageWithTimeout(time.Until(deadline))
 		if err != nil {
+			if errors.Is(err, errReadTimeout) {
+				return fmt.Errorf("%s: timed out after %s waiting for response", errorPrefix, defaultResponseTimeout)
+			}
 			return err
 		}
 		switch resp := msg.(type) {
@@ -313,9 +327,13 @@ func readAndValidateResponse(client *DAPClient, requestSeq int, errorPrefix stri
 // command, so we match by request_seq rather than Go type alone.
 func readTypedResponse[T dap.ResponseMessage](client *DAPClient, requestSeq int) (T, error) {
 	var zero T
+	deadline := time.Now().Add(defaultResponseTimeout)
 	for {
-		msg, err := client.ReadMessage()
+		msg, err := client.ReadMessageWithTimeout(time.Until(deadline))
 		if err != nil {
+			if errors.Is(err, errReadTimeout) {
+				return zero, fmt.Errorf("timed out after %s waiting for response", defaultResponseTimeout)
+			}
 			return zero, err
 		}
 		switch resp := msg.(type) {
@@ -401,9 +419,10 @@ func (ds *debuggerSession) clearBreakpoints(ctx context.Context, _ *mcp.CallTool
 
 // ContinueParams defines the parameters for continuing execution.
 type ContinueParams struct {
-	ThreadID    FlexInt         `json:"threadId,omitempty" mcp:"thread to continue (default: all threads)"`
-	To          *BreakpointSpec `json:"to,omitempty" mcp:"location to run to (sets temporary breakpoint)"`
-	FullContext bool            `json:"fullContext,omitempty" mcp:"if true, return full context (stack trace and variables) when stopped; if false (default), return a compact stop summary — leave false unless you need variables immediately"`
+	ThreadID       FlexInt         `json:"threadId,omitempty" mcp:"thread to continue (default: all threads)"`
+	To             *BreakpointSpec `json:"to,omitempty" mcp:"location to run to (sets temporary breakpoint)"`
+	FullContext    bool            `json:"fullContext,omitempty" mcp:"if true, return full context (stack trace and variables) when stopped; if false (default), return a compact stop summary — leave false unless you need variables immediately"`
+	TimeoutSeconds FlexInt         `json:"timeoutSeconds,omitempty" mcp:"max seconds to wait for the program to stop before pausing it and returning control (default 10). On timeout the program is paused and its current location reported, so you can inspect it or call continue again — it never blocks forever"`
 }
 
 // continueExecution continues execution and returns full context when stopped.
@@ -426,7 +445,10 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.CallToo
 				return nil, nil, err
 			}
 		}
-		if _, err := ds.client.ReadMessage(); err != nil {
+		if _, err := ds.client.ReadMessageWithTimeout(defaultResponseTimeout); err != nil {
+			if errors.Is(err, errReadTimeout) {
+				return nil, nil, fmt.Errorf("continue: timed out setting run-to-cursor breakpoint")
+			}
 			return nil, nil, err
 		}
 	}
@@ -440,32 +462,69 @@ func (ds *debuggerSession) continueExecution(ctx context.Context, _ *mcp.CallToo
 		return nil, nil, err
 	}
 
+	result, err := ds.waitForStop(threadID, continueSeq, stopTimeout(params.TimeoutSeconds), "continue", params.FullContext)
+	return result, nil, err
+}
+
+// waitForStop reads DAP messages until the running program stops or terminates,
+// then returns the resulting context. cmdSeq is the request_seq of the resume
+// command (continue/step) whose failure should abort the wait.
+//
+// If the program does not stop within timeout, waitForStop issues a DAP pause
+// so the call returns instead of blocking the session (and its mutex) forever,
+// and reports the location where execution was interrupted. This relies on the
+// adapter honoring a pause while the target runs, which both dlv and gdb do.
+//
+// Every read is bounded: first up to timeout for a natural stop, then up to
+// pauseConfirmTimeout for the pause to take effect. If even the pause is not
+// confirmed (e.g. the adapter or a remote connection has gone unresponsive),
+// waitForStop returns an error rather than blocking.
+func (ds *debuggerSession) waitForStop(threadID, cmdSeq int, timeout time.Duration, errPrefix string, fullContext bool) (*mcp.CallToolResult, error) {
+	pausing := false
+	deadline := time.Now().Add(timeout)
 	for {
-		msg, err := ds.client.ReadMessage()
+		msg, err := ds.client.ReadMessageWithTimeout(time.Until(deadline))
 		if err != nil {
-			return nil, nil, err
+			if errors.Is(err, errReadTimeout) {
+				if !pausing {
+					// No stop within the deadline: pause so control returns. The
+					// stop we read next will normally carry reason "pause".
+					if _, perr := ds.client.PauseRequest(threadID); perr != nil {
+						return nil, fmt.Errorf("%s: timed out after %s and could not pause: %w", errPrefix, timeout, perr)
+					}
+					pausing = true
+					deadline = time.Now().Add(pauseConfirmTimeout)
+					continue
+				}
+				// Pause requested but never confirmed: do not hang — surface it.
+				return nil, fmt.Errorf("%s: program did not stop within %s and the pause was not confirmed within a further %s; the adapter or connection may be unresponsive", errPrefix, timeout, pauseConfirmTimeout)
+			}
+			return nil, err
 		}
 		switch resp := msg.(type) {
 		case dap.ResponseMessage:
 			r := resp.GetResponse()
-			if r.RequestSeq != continueSeq {
-				log.Printf("continueExecution: skipping out-of-order response (request_seq=%d, waiting for %d)", r.RequestSeq, continueSeq)
-				continue
+			if r.RequestSeq == cmdSeq && !r.Success {
+				return nil, fmt.Errorf("%s failed: %s", errPrefix, r.Message)
 			}
-			if !r.Success {
-				return nil, nil, fmt.Errorf("continue failed: %s", r.Message)
-			}
+			// Other responses (the pause response, out-of-order replies) are skipped.
 		case *dap.StoppedEvent:
 			ds.stoppedThreadID = resp.Body.ThreadId
 			result, err := ds.getFullContext(resp.Body.ThreadId, 0, 20)
-			if err != nil || params.FullContext {
-				return result, nil, err
+			if err != nil {
+				return result, err
 			}
-			return stopSummary(result, resp.Body.Reason), nil, nil
+			if pausing && resp.Body.Reason == "pause" {
+				return timeoutPausedSummary(result, timeout), nil
+			}
+			if fullContext {
+				return result, nil
+			}
+			return stopSummary(result, resp.Body.Reason), nil
 		case *dap.TerminatedEvent:
 			return &mcp.CallToolResult{
 				Content: []mcp.Content{&mcp.TextContent{Text: "Program terminated"}},
-			}, nil, nil
+			}, nil
 		}
 	}
 }
@@ -528,9 +587,13 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.CallTo
 		return nil, nil, err
 	}
 
+	deadline := time.Now().Add(defaultResponseTimeout)
 	for {
-		msg, err := ds.client.ReadMessage()
+		msg, err := ds.client.ReadMessageWithTimeout(time.Until(deadline))
 		if err != nil {
+			if errors.Is(err, errReadTimeout) {
+				return nil, nil, fmt.Errorf("unable to evaluate expression: timed out after %s waiting for response", defaultResponseTimeout)
+			}
 			return nil, nil, err
 		}
 		switch resp := msg.(type) {
@@ -807,26 +870,63 @@ func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.CallToolRequest, par
 	}
 
 	if detach && ds.client != nil {
-		// Send disconnect with terminateDebuggee=false so the debuggee keeps running.
-		seq, err := ds.client.DisconnectRequest(false)
-		if err != nil {
-			log.Printf("stop: disconnect request failed: %v", err)
-		} else {
-			if err := readAndValidateResponse(ds.client, seq, "disconnect"); err != nil {
-				log.Printf("stop: disconnect response error: %v", err)
-			}
-		}
+		// Leave the debuggee running after the adapter disconnects.
+		ds.disconnect(false)
 		ds.cleanup()
 		return &mcp.CallToolResult{
 			Content: []mcp.Content{&mcp.TextContent{Text: "Detached from process (debuggee still running)"}},
 		}, nil, nil
 	}
 
+	if ds.client != nil {
+		// Ask the adapter to terminate the debuggee it launched, so we don't
+		// orphan a still-running process. For an attach we only detach, since
+		// the target is a process the user merely connected to, not one we own.
+		ds.disconnect(ds.launchMode != "attach")
+	}
 	ds.cleanup()
 
 	return &mcp.CallToolResult{
 		Content: []mcp.Content{&mcp.TextContent{Text: "Debug session stopped"}},
 	}, nil, nil
+}
+
+// disconnectTimeout bounds the graceful DAP disconnect during teardown.
+const disconnectTimeout = 2 * time.Second
+
+// disconnect asks the adapter to disconnect, optionally terminating the
+// debuggee it launched (pass false to leave it running / detach), and waits
+// for the response. It can never hang teardown: the request and its response
+// run in a goroutine, and if they do not complete within disconnectTimeout the
+// caller proceeds to cleanup, whose Close() unblocks any stuck socket
+// operation (a wedged write as well as a missing response). Failures are
+// logged rather than fatal — cleanup force-kills the adapter regardless.
+func (ds *debuggerSession) disconnect(terminateDebuggee bool) {
+	client := ds.client
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		seq, err := client.DisconnectRequest(terminateDebuggee)
+		if err != nil {
+			log.Printf("stop: disconnect request failed: %v", err)
+			return
+		}
+		deadline := time.Now().Add(disconnectTimeout)
+		for {
+			msg, err := client.ReadMessageWithTimeout(time.Until(deadline))
+			if err != nil {
+				return
+			}
+			if r, ok := msg.(dap.ResponseMessage); ok && r.GetResponse().RequestSeq == seq {
+				return
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(disconnectTimeout):
+		log.Printf("stop: disconnect did not complete within %s; forcing teardown", disconnectTimeout)
+	}
 }
 
 // cleanup kills the DAP adapter process and resets session state.
@@ -847,7 +947,20 @@ func (ds *debuggerSession) cleanup() {
 				log.Printf("cleanup: error killing debugger process: %v", err)
 			}
 		}
-		ds.cmd.Wait()
+		// Reap with a bound so teardown can never hang. A debuggee left running
+		// (e.g. after a detach, or if a graceful terminate did not take) can
+		// keep the adapter's inherited stdio pipes open, which would otherwise
+		// make Wait block forever.
+		done := make(chan struct{})
+		go func() {
+			ds.cmd.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			log.Printf("cleanup: adapter did not exit within 2s of kill; continuing")
+		}
 		ds.cmd = nil
 	}
 
@@ -1065,9 +1178,13 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 	// The launch response may arrive before or after — if it arrives here,
 	// we consume it. If it arrives later, it will be automatically skipped
 	// as an out-of-order response by subsequent seq-based readers.
+	initDeadline := time.Now().Add(defaultResponseTimeout)
 	for {
-		msg, err := ds.client.ReadMessage()
+		msg, err := ds.client.ReadMessageWithTimeout(time.Until(initDeadline))
 		if err != nil {
+			if errors.Is(err, errReadTimeout) {
+				return nil, nil, fmt.Errorf("unable to start debug session: timed out after %s waiting for launch/initialized", defaultResponseTimeout)
+			}
 			return nil, nil, err
 		}
 		switch resp := msg.(type) {
@@ -1124,9 +1241,13 @@ initialized:
 	// For core dump mode, the program is already stopped at the crash point.
 	// Wait for the StoppedEvent from the adapter before returning context.
 	if mode == "core" {
+		coreDeadline := time.Now().Add(defaultResponseTimeout)
 		for {
-			msg, err := ds.client.ReadMessage()
+			msg, err := ds.client.ReadMessageWithTimeout(time.Until(coreDeadline))
 			if err != nil {
+				if errors.Is(err, errReadTimeout) {
+					return nil, nil, fmt.Errorf("unable to load core dump: timed out after %s waiting for stop", defaultResponseTimeout)
+				}
 				return nil, nil, err
 			}
 			switch ev := msg.(type) {
@@ -1158,10 +1279,27 @@ initialized:
 	// We handle both by reading the first StoppedEvent. If it's an entry stop,
 	// we send ContinueRequest and wait for the next stop.
 	if len(params.Breakpoints) > 0 && !params.StopOnEntry {
+		// Running to the first breakpoint is an execution wait, exactly like
+		// continue: it must be bounded so a breakpoint that never binds cannot
+		// hang session startup. Wait up to defaultStopTimeout for the stop, then
+		// up to pauseConfirmTimeout for a pause we issue ourselves.
 		var stoppedThreadID int
+		pausing := false
+		deadline := time.Now().Add(defaultStopTimeout)
 		for {
-			msg, err := ds.client.ReadMessage()
+			msg, err := ds.client.ReadMessageWithTimeout(time.Until(deadline))
 			if err != nil {
+				if errors.Is(err, errReadTimeout) && !pausing {
+					if _, perr := ds.client.PauseRequest(ds.defaultThreadID()); perr != nil {
+						return nil, nil, fmt.Errorf("debug: timed out reaching breakpoint and could not pause: %w", perr)
+					}
+					pausing = true
+					deadline = time.Now().Add(pauseConfirmTimeout)
+					continue
+				}
+				if errors.Is(err, errReadTimeout) {
+					return nil, nil, fmt.Errorf("debug: program did not reach a breakpoint within %s and the pause was not confirmed within a further %s", defaultStopTimeout, pauseConfirmTimeout)
+				}
 				return nil, nil, err
 			}
 			switch ev := msg.(type) {
@@ -1259,53 +1397,26 @@ func (ds *debuggerSession) step(ctx context.Context, _ *mcp.CallToolRequest, par
 	}
 
 	// Execute the appropriate step command
+	var (
+		stepSeq int
+		err     error
+	)
 	switch params.Mode {
 	case "over":
-		stepSeq, err := ds.client.NextRequest(threadID)
-		if err != nil {
-			return nil, nil, err
-		}
-		_ = stepSeq
+		stepSeq, err = ds.client.NextRequest(threadID)
 	case "in":
-		stepSeq, err := ds.client.StepInRequest(threadID)
-		if err != nil {
-			return nil, nil, err
-		}
-		_ = stepSeq
+		stepSeq, err = ds.client.StepInRequest(threadID)
 	case "out":
-		stepSeq, err := ds.client.StepOutRequest(threadID)
-		if err != nil {
-			return nil, nil, err
-		}
-		_ = stepSeq
+		stepSeq, err = ds.client.StepOutRequest(threadID)
 	default:
 		return nil, nil, fmt.Errorf("invalid step mode: %s (must be 'over', 'in', or 'out')", params.Mode)
 	}
-
-	// Wait for stopped or terminated event
-	for {
-		msg, err := ds.client.ReadMessage()
-		if err != nil {
-			return nil, nil, err
-		}
-		switch resp := msg.(type) {
-		case dap.ResponseMessage:
-			if !resp.GetResponse().Success {
-				return nil, nil, fmt.Errorf("step failed: %s", resp.GetResponse().Message)
-			}
-		case *dap.StoppedEvent:
-			ds.stoppedThreadID = resp.Body.ThreadId
-			result, err := ds.getFullContext(resp.Body.ThreadId, 0, 20)
-			if err != nil || params.FullContext {
-				return result, nil, err
-			}
-			return stopSummary(result, resp.Body.Reason), nil, nil
-		case *dap.TerminatedEvent:
-			return &mcp.CallToolResult{
-				Content: []mcp.Content{&mcp.TextContent{Text: "Program terminated"}},
-			}, nil, nil
-		}
+	if err != nil {
+		return nil, nil, err
 	}
+
+	result, err := ds.waitForStop(threadID, stepSeq, stopTimeout(params.TimeoutSeconds), "step", params.FullContext)
+	return result, nil, err
 }
 
 // getFullContext returns a complete context dump including location, stack trace, scopes, and variables.
@@ -1372,6 +1483,49 @@ func (ds *debuggerSession) getFullContext(threadID, frameID, maxFrames int) (*mc
 
 // stopSummary extracts a compact stop message from a full context result,
 // showing just the current location and a prompt to call 'context'.
+// defaultStopTimeout bounds how long continue/step wait for the program to
+// stop before pausing it and returning control. Without a bound, a breakpoint
+// that never binds or a program that never halts would block the tool call —
+// and the session mutex it holds — forever.
+const defaultStopTimeout = 10 * time.Second
+
+// pauseConfirmTimeout bounds how long waitForStop waits for a pause it issued
+// (after the main timeout elapsed) to actually halt the program, so that an
+// unresponsive adapter or connection can never turn the pause into a new hang.
+const pauseConfirmTimeout = 5 * time.Second
+
+// stopTimeout resolves a caller-supplied timeout in seconds to a duration,
+// falling back to defaultStopTimeout when unset or non-positive.
+func stopTimeout(seconds FlexInt) time.Duration {
+	if s := seconds.Int(); s > 0 {
+		return time.Duration(s) * time.Second
+	}
+	return defaultStopTimeout
+}
+
+// timeoutPausedSummary reports that the program was still running after the
+// wait timeout and has been paused so it can be inspected or resumed.
+func timeoutPausedSummary(full *mcp.CallToolResult, timeout time.Duration) *mcp.CallToolResult {
+	text := ""
+	if len(full.Content) > 0 {
+		if tc, ok := full.Content[0].(*mcp.TextContent); ok {
+			text = tc.Text
+		}
+	}
+	var summary strings.Builder
+	fmt.Fprintf(&summary, "Still running after %s — paused execution.\n", timeout)
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, "Function:") || strings.HasPrefix(line, "File:") {
+			summary.WriteString(line + "\n")
+		}
+	}
+	summary.WriteString("The program did not reach a breakpoint in time and is now paused. ")
+	summary.WriteString("Call 'context' to inspect, or 'continue' to keep running.")
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{&mcp.TextContent{Text: summary.String()}},
+	}
+}
+
 func stopSummary(full *mcp.CallToolResult, reason string) *mcp.CallToolResult {
 	text := ""
 	if len(full.Content) > 0 {

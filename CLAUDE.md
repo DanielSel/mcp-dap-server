@@ -182,7 +182,7 @@ func TestSomething(t *testing.T) {
 
 ### Response Handling
 - Some tools read multiple messages (events + responses) in a loop
-- `continue` and `step` (all modes) wait for `StoppedEvent` or `TerminatedEvent`
+- `continue` and `step` (all modes) wait for `StoppedEvent` or `TerminatedEvent` via the shared `waitForStop` helper, bounded by `timeoutSeconds` (default `defaultStopTimeout`, 10s). On timeout `waitForStop` issues a DAP pause and returns the current location instead of blocking forever. The blocking read is made cancelable by a background reader goroutine in `dap.go` (`readLoop` → `recvCh`; use `ReadMessageWithTimeout`)
 - The `context` tool automatically fetches scopes and variables for the current frame
 
 ### Tool Naming Convention
@@ -195,7 +195,7 @@ func TestSomething(t *testing.T) {
 2. **Frame IDs vs Thread IDs**: Frame IDs come from stack traces, thread IDs from the threads request. Delve uses frame IDs starting at 1000.
 3. **Variables References**: The `variablesReference` in scopes/variables is a DAP protocol identifier, not a simple index. Delve uses frame_id+1 for locals scope (e.g., 1001 for frame 1000).
 4. **Stopped Event Format**: Contains `Reason` field ("breakpoint", "function breakpoint", "step", "entry", "pause", etc.) and `ThreadId`
-5. **Serialized Tool Calls**: All tool calls are serialized by a mutex. Concurrent MCP tool calls will queue rather than race. Long-running operations (continue, step) hold the lock until completion.
+5. **Serialized Tool Calls**: All tool calls are serialized by a mutex. Concurrent MCP tool calls will queue rather than race. `continue`/`step` hold the lock while waiting for a stop, but that wait is bounded by `timeoutSeconds` (default 10s) — on timeout they pause the program and return, releasing the lock, so a never-hit breakpoint can no longer hang the session.
 6. **Capability-Gated Tools**: `set-variable`, `disassemble`, and `restart` are only available when the DAP adapter reports support via capabilities
 7. **Test Binary Paths**: Must be absolute paths for the `debug` tool in binary mode
 8. **go-dap ErrorResponse Decoding**: go-dap decodes ALL failed responses (`success: false`) as `*dap.ErrorResponse` regardless of command. Response matching must use `request_seq`, not Go type

@@ -7,7 +7,13 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
+
+// spawnStartupTimeout bounds how long we wait for a freshly spawned adapter to
+// announce its listen address before giving up, so a wedged adapter cannot hang
+// the debug tool at startup.
+const spawnStartupTimeout = 15 * time.Second
 
 // DebuggerBackend abstracts the debugger-specific logic for spawning a DAP
 // server and building the launch/attach argument maps. Each supported debugger
@@ -59,32 +65,44 @@ func (b *delveBackend) Spawn(port string, stderrWriter io.Writer) (*exec.Cmd, st
 		return nil, "", err
 	}
 
-	// Wait for server to start and parse actual listen address
-	r := bufio.NewReader(stdout)
-	var listenAddr string
-	for {
-		s, err := r.ReadString('\n')
-		if err != nil {
-			cmd.Process.Kill()
-			cmd.Wait()
-			return nil, "", err
-		}
-		if strings.HasPrefix(s, "DAP server listening at") {
-			// Parse address from "DAP server listening at: 127.0.0.1:PORT"
-			parts := strings.SplitN(s, ": ", 2)
-			if len(parts) == 2 {
-				listenAddr = strings.TrimSpace(parts[1])
+	// Wait for the server to start and announce its listen address, reading the
+	// stdout pipe in a goroutine so the wait can be bounded (os pipes do not
+	// support read deadlines).
+	addrCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		r := bufio.NewReader(stdout)
+		for {
+			s, err := r.ReadString('\n')
+			if err != nil {
+				errCh <- err
+				return
 			}
-			break
+			if strings.HasPrefix(s, "DAP server listening at") {
+				// Parse address from "DAP server listening at: 127.0.0.1:PORT"
+				parts := strings.SplitN(s, ": ", 2)
+				if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
+					addrCh <- strings.TrimSpace(parts[1])
+					return
+				}
+				errCh <- fmt.Errorf("failed to parse DAP server listen address from %q", s)
+				return
+			}
 		}
-	}
-	if listenAddr == "" {
+	}()
+
+	select {
+	case listenAddr := <-addrCh:
+		return cmd, listenAddr, nil
+	case err := <-errCh:
 		cmd.Process.Kill()
 		cmd.Wait()
-		return nil, "", fmt.Errorf("failed to parse DAP server listen address")
+		return nil, "", err
+	case <-time.After(spawnStartupTimeout):
+		cmd.Process.Kill()
+		cmd.Wait()
+		return nil, "", fmt.Errorf("dlv did not report a listen address within %s", spawnStartupTimeout)
 	}
-
-	return cmd, listenAddr, nil
 }
 
 // TransportMode returns "tcp" because Delve communicates over a TCP socket.

@@ -25,6 +25,25 @@ Before starting, gather:
 
 ---
 
+## Execution waits are bounded — reason about `timeoutSeconds`
+
+`continue` and `step` wrap an asynchronous protocol (DAP) in a synchronous call:
+they wait up to `timeoutSeconds` (default 10) for the program to stop, then
+**pause it** and return `Still running … paused at <file:line>` rather than ever
+blocking. This is normal, not an error.
+
+- You can only inspect (`context`, `evaluate`) while the program is **stopped** —
+  never while it runs. The timeout pauses it so you can.
+- Prefer **short timeouts in a loop**: a quick "still running, paused" return is
+  a checkpoint, not a failure. Match the budget to what you're waiting on — 1–2s
+  for a breakpoint you expect to hit immediately; longer only when you must wait
+  on input you then trigger yourself: `continue(timeoutSeconds=3)`.
+- A `timed out … waiting for response` *error* (distinct from the paused summary)
+  means the adapter or connection is unresponsive — `stop` and restart the
+  session rather than retrying the same call blindly.
+
+---
+
 ## Step-by-Step Workflow
 
 ### 1. Start the session
