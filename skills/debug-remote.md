@@ -119,25 +119,33 @@ If the connection fails:
 - Confirm the remote started `dlv dap` with `--only-same-user=false`.
 - Confirm the pod is running and the binary path exists in the container.
 
-### 2. Map remote build paths to local paths (substitutePath)
+### 2. Map your local paths to the binary's build paths (substitutePath)
 
-A breakpoint set by your **local** file path only binds if that path matches the
-**build** path compiled into the remote binary. In CI these usually differ, so
-without a mapping breakpoints silently fail to verify.
+A breakpoint set by your **local** file path only binds if Delve can translate it
+to the **build** path compiled into the remote binary. In CI these usually
+differ, so without a mapping breakpoints silently fail to verify.
 
-First, discover the remote build path: after connecting, run `context()` and read
-the `File:` line — that is the path the binary knows (e.g. `/build/main.go`). Map
-your local root onto it. Then reconnect with the mapping (or pass it on the first
-`debug` call):
+`substitutePath` follows Delve's direction exactly — **`from` = your local path,
+`to` = the path baked into the binary**. (Mnemonic: `from` where you set the
+breakpoint, `to` what the binary knows.) Get the direction backwards and *both*
+path forms fail: a local-path breakpoint won't match `from`, and a build-path
+breakpoint gets rewritten to a local path the binary's DWARF doesn't contain.
+
+First, discover the binary's build path. Connect **without** `substitutePath`,
+set a **function** breakpoint (resolves by symbol, needs no path), `continue`,
+and read the `File:` line from `context()` — that path (e.g. `/build/main.go`) is
+your `to`; your local checkout root is your `from`. Then reconnect with the
+mapping (or pass it on the first `debug` call):
 
 ```json
 debug(mode="binary", address="127.0.0.1:40000", path="/app/server",
-      substitutePath=[{"from": "/build", "to": "/Users/me/project"}])
+      substitutePath=[{"from": "/Users/me/project", "to": "/build"}])
 ```
 
-Now a local breakpoint at `/Users/me/project/main.go:42` resolves to the remote
-`/build/main.go:42`. Omit `substitutePath` entirely when the paths already match
-(e.g. the remote debugger shares your filesystem).
+Now a local breakpoint at `/Users/me/project/main.go:42` binds to the binary's
+`/build/main.go:42`, and `context()` reports locations back as your local paths.
+Omit `substitutePath` entirely when the paths already match (e.g. the remote
+debugger shares your filesystem).
 
 ### 3. Set breakpoints (local paths)
 
@@ -189,8 +197,9 @@ Need to debug code running in a remote container
     ├─ Remote runs `dlv dap --listen` + port-forwarded?
     │      → debug(mode="binary"/"attach", address=..., substitutePath=[...])
     │
-    ├─ Breakpoint "not verified"?
-    │      → substitutePath wrong: read File: from context(), remap from/to
+    ├─ Breakpoint "not verified" (or error names the wrong path form)?
+    │      → substitutePath direction wrong. from=YOUR local path, to=binary
+    │        build path. Find the build path via a function bp + context()
     │
     ├─ `continue` returned "Still running … paused"?
     │      → normal: breakpoint not hit yet. Trigger the request, continue again
@@ -209,5 +218,5 @@ Need to debug code running in a remote container
 > **Diagnosis:** In pod `api-7f9c`, `ProcessOrder` at `/build/order.go:88` reads a
 > nil `order.Customer` because the upstream cache returned a partial record.
 > **Evidence:** `context()` shows `order.Customer == nil`; the breakpoint bound via
-> `substitutePath` (`/build` → local checkout).
+> `substitutePath` (local checkout → `/build`).
 > **Fix:** validate the cache record before dereferencing, or repopulate on miss.

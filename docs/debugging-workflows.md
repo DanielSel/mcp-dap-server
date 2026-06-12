@@ -155,7 +155,7 @@ flowchart TD
     B --> C[debug&#40;mode='binary', address='127.0.0.1:40000', path='/app/server', substitutePath=[...]&#41;]
     C --> D[breakpoint&#40;file='local/main.go', line=42&#41;]
     D --> E{Breakpoint verified?}
-    E -- no --> F[Fix substitutePath: map remote build path to local path]
+    E -- no --> F[Fix substitutePath direction: from=local path, to=binary build path]
     F --> D
     E -- yes --> G[continue&#40;&#41; / context&#40;&#41; / step&#40;&#41; — same as local]
     G --> H[stop&#40;&#41; — detaches by default, remote workload survives]
@@ -166,7 +166,7 @@ flowchart TD
 **Typical sequence:**
 1. Remote: `dlv dap --listen=:40000 --only-same-user=false --api-version=2` (built with `-gcflags=all="-N -l"`)
 2. `kubectl port-forward pod/my-pod 40000:40000`
-3. `debug(mode="binary", address="127.0.0.1:40000", path="/app/server", substitutePath=[{"from": "/build", "to": "/local/checkout"}])`
+3. `debug(mode="binary", address="127.0.0.1:40000", path="/app/server", substitutePath=[{"from": "/local/checkout", "to": "/build"}])` (`from`=local, `to`=binary build path)
    - Or attach to the in-container pid: `debug(mode="attach", address="127.0.0.1:40000", processId=1)`
 4. `breakpoint(file="/local/checkout/main.go", line=42)` — `substitutePath` makes it bind to the remote binary
 5. `continue()`, `context()`, `evaluate(...)` — identical to a local session

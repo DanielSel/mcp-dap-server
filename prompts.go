@@ -641,13 +641,14 @@ func promptDebugRemote(_ context.Context, req *mcp.GetPromptRequest) (*mcp.GetPr
 
 	// Build the substitutePath example. Use the provided roots if any, else
 	// illustrative placeholders, so the user always sees a concrete mapping.
-	exFrom := remoteSource
-	exTo := localSource
-	if exFrom == "" {
-		exFrom = "/build"
+	// Delve's direction: from = local path, to = the path baked into the binary.
+	localRoot := localSource
+	buildRoot := remoteSource
+	if localRoot == "" {
+		localRoot = "/Users/me/project"
 	}
-	if exTo == "" {
-		exTo = "/Users/me/project"
+	if buildRoot == "" {
+		buildRoot = "/build"
 	}
 
 	content := fmt.Sprintf(`## Remote Debug Session (Go binary in a container)
@@ -692,14 +693,17 @@ JSON form:
 `+"```"+`
 
 **Why `+"`"+`substitutePath`+"`"+` matters:** breakpoints you set by your *local* file
-path must match the *build* paths compiled into the remote binary. If your CI
-built the binary under `+"`"+`%s`+"`"+` but your checkout lives at `+"`"+`%s`+"`"+`, the mapping
-above lets a local breakpoint like `+"`"+`%s/main.go:42`+"`"+` bind to the remote
+path must be translated to the *build* paths compiled into the remote binary.
+The direction is Delve's: **`+"`"+`from`+"`"+` = your local path, `+"`"+`to`+"`"+` = the path baked
+into the binary** (get it backwards and *both* path forms fail to bind). If your
+checkout lives at `+"`"+`%s`+"`"+` but CI built the binary under `+"`"+`%s`+"`"+`, the mapping above
+lets a local breakpoint like `+"`"+`%s/main.go:42`+"`"+` bind to the binary's
 `+"`"+`%s/main.go:42`+"`"+`. Omit it only if the paths are already identical.
 
-> To find the remote build path, run `+"`"+`evaluate(expression="runtime.GOROOT()")`+"`"+`
-> after connecting, or inspect a stack frame's `+"`"+`File:`+"`"+` line from `+"`"+`context()`+"`"+` —
-> that is the path the binary knows. Map your local root onto it.
+> To find the build path (your `+"`"+`to`+"`"+`): connect **without** `+"`"+`substitutePath`+"`"+`,
+> set a *function* breakpoint (resolves by symbol, no path needed), `+"`"+`continue`+"`"+`,
+> and read the `+"`"+`File:`+"`"+` line from `+"`"+`context()`+"`"+` — that is the path the binary
+> knows. Your local checkout root is your `+"`"+`from`+"`"+`.
 
 ---
 
@@ -742,16 +746,16 @@ workload is not killed. To force termination of the remote debuggee, call
 > 'connect' mode will target that setup).
 `,
 		address,
-		mode, address, target, exFrom, exTo,
-		mode, address, target, exFrom, exTo,
-		exFrom, exTo, exTo, exFrom,
+		mode, address, target, localRoot, buildRoot,
+		mode, address, target, localRoot, buildRoot,
+		localRoot, buildRoot, localRoot, buildRoot,
 		func() string {
 			if breakpoints != "" {
 				return fmt.Sprintf("\nRequested breakpoints: `%s`\n", breakpoints)
 			}
 			return ""
 		}(),
-		exTo,
+		localRoot,
 	)
 
 	return &mcp.GetPromptResult{

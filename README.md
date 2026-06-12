@@ -95,7 +95,7 @@ Start a debugging session. Supports four modes:
 - `stopOnEntry` (boolean): Stop at program entry point
 - `port` (number): Port for the locally-spawned DAP server (ignored when `address` is set)
 - `address` (string): `host:port` of an already-running DAP server to connect to (e.g. a remote `dlv dap --listen`). When set, no local debugger is spawned; `mode`/`path`/`processId` are interpreted on the remote host. See [Remote debugging](#remote-debugging-kubernetes-containers).
-- `substitutePath` (array): Source path mappings (Delve only), each `{ "from": "<remote build path>", "to": "<local path>" }`, so breakpoints set by local path bind to the remote binary's build paths.
+- `substitutePath` (array): Source path mappings (Delve only), each `{ "from": "<your local path>", "to": "<remote build path>" }` (`from` = local, `to` = the path compiled into the binary), so breakpoints set by local path bind to the remote binary's build paths.
 
 Returns full context (location, stack trace, variables) when stopped.
 
@@ -218,7 +218,7 @@ kubectl port-forward pod/my-pod 40000:40000
   "path": "/app/server",
   "address": "127.0.0.1:40000",
   "substitutePath": [
-    { "from": "/build", "to": "/Users/me/project" }
+    { "from": "/Users/me/project", "to": "/build" }
   ]
 }
 ```
@@ -229,24 +229,28 @@ kubectl port-forward pod/my-pod 40000:40000
 
 ### `substitutePath`: making breakpoints bind
 
-A breakpoint set by your **local** file path only binds if that path matches the
-**build path** compiled into the remote binary. In CI these usually differ, so
-breakpoints silently fail to verify. `substitutePath` maps one to the other.
+A breakpoint set by your **local** file path only binds if Delve can translate it
+to the **build path** compiled into the remote binary. In CI these usually
+differ, so breakpoints silently fail to verify. `substitutePath` maps one to the
+other, using Delve's direction: **`from` = your local path, `to` = the path baked
+into the binary** (getting this backwards makes *both* path forms fail to bind).
 
-Example: CI built the binary under `/build`, your checkout is at
-`/Users/me/project`:
+Example: your checkout is at `/Users/me/project`, CI built the binary under
+`/build`:
 
 ```json
 "substitutePath": [
-  { "from": "/build", "to": "/Users/me/project" }
+  { "from": "/Users/me/project", "to": "/build" }
 ]
 ```
 
-Now a local breakpoint at `/Users/me/project/main.go:42` resolves to the remote
-`/build/main.go:42`. To discover the remote build path, connect first and look at
-the `File:` path printed by `context()` — that is the path the binary knows; map
-your local root onto it. Omit `substitutePath` entirely when the paths already
-match (e.g. the remote debugger shares your filesystem).
+Now a local breakpoint at `/Users/me/project/main.go:42` binds to the binary's
+`/build/main.go:42`, and `context()` reports locations back as your local paths.
+To discover the build path, connect first **without** `substitutePath`, set a
+function breakpoint (no path needed), `continue`, and read the `File:` path
+printed by `context()` — that is your `to`; your local checkout root is your
+`from`. Omit `substitutePath` entirely when the paths already match (e.g. the
+remote debugger shares your filesystem).
 
 > Need reconnect / detach-and-reattach, or the app to keep running whether or not
 > a debugger is attached? Run the remote as

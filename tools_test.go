@@ -1817,6 +1817,77 @@ func TestRemoteConnect(t *testing.T) {
 	ts.stopDebugger(t)
 }
 
+// TestSubstitutePathBinds verifies the substitutePath direction end to end:
+// from = the local path used to set breakpoints, to = the path compiled into
+// the binary. A breakpoint set by a path that exists nowhere except as the
+// mapping's "from" must still bind via the rewrite to the real build path;
+// reversing from/to would leave it unbound and the program would run to
+// completion instead of stopping. It also checks the reverse mapping: the stop
+// location is reported back as the local "from" path.
+func TestSubstitutePathBinds(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "helloworld")
+	defer cleanupBinary()
+
+	addr, cleanupDlv := startRemoteDlvDap(t)
+	defer cleanupDlv()
+
+	// The binary's debug info contains this real source directory.
+	realDir := filepath.Join(ts.cwd, "testdata", "go", "helloworld")
+	// A path that exists neither on disk nor in the binary's debug info.
+	fakeLocalDir := "/pretend/local/helloworld"
+
+	// from = fake local path, to = the real build path baked into the binary.
+	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name: "debug",
+		Arguments: map[string]any{
+			"mode":           "binary",
+			"path":           binaryPath,
+			"address":        addr,
+			"substitutePath": []map[string]any{{"from": fakeLocalDir, "to": realDir}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to start remote debug session: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("Remote debug session returned error: %v", result.Content)
+	}
+
+	// Set the breakpoint by the FAKE local path; substitutePath must rewrite it
+	// to the real build path for it to bind.
+	bpText, isErr := ts.callTool(t, "breakpoint", map[string]any{
+		"file": filepath.Join(fakeLocalDir, "main.go"),
+		"line": 7,
+	})
+	if isErr {
+		t.Fatalf("breakpoint returned error: %s", bpText)
+	}
+
+	contText, isErr := ts.callTool(t, "continue", map[string]any{})
+	if isErr {
+		t.Fatalf("continue returned error: %s", contText)
+	}
+	// Wrong direction => breakpoint never binds => program terminates here.
+	if strings.Contains(contText, "terminated") {
+		t.Fatalf("program terminated; breakpoint set via substitutePath did not bind (direction wrong?): %s", contText)
+	}
+
+	contextStr := ts.getContextContent(t)
+	if !strings.Contains(contextStr, "main.main") {
+		t.Errorf("expected to stop in main.main, got: %s", contextStr)
+	}
+	// The location is reported back as the local "from" path, proving the
+	// reverse (server->client) mapping is applied too.
+	if !strings.Contains(contextStr, fakeLocalDir) {
+		t.Errorf("expected context to report the local path %q (reverse mapping), got: %s", fakeLocalDir, contextStr)
+	}
+
+	ts.stopDebugger(t)
+}
+
 // TestRemoteInvalidAddress verifies a malformed 'address' is rejected before any
 // connection attempt, without needing a real DAP server.
 func TestRemoteInvalidAddress(t *testing.T) {
@@ -1841,19 +1912,21 @@ func TestRemoteInvalidAddress(t *testing.T) {
 }
 
 // TestSubstitutePathArg verifies path mappings are converted into the
-// array-of-objects shape Delve expects.
+// array-of-objects shape Delve expects, passing from/to through unchanged.
+// Per Delve's semantics, From is the local/client path and To is the path
+// compiled into the binary.
 func TestSubstitutePathArg(t *testing.T) {
 	got := substitutePathArg([]PathMapping{
-		{From: "/build", To: "/Users/me/project"},
-		{From: "/go/pkg", To: "/Users/me/go/pkg"},
+		{From: "/Users/me/project", To: "/build"},
+		{From: "/Users/me/go/pkg", To: "/go/pkg"},
 	})
 	if len(got) != 2 {
 		t.Fatalf("expected 2 mappings, got %d", len(got))
 	}
-	if got[0]["from"] != "/build" || got[0]["to"] != "/Users/me/project" {
+	if got[0]["from"] != "/Users/me/project" || got[0]["to"] != "/build" {
 		t.Errorf("unexpected first mapping: %v", got[0])
 	}
-	if got[1]["from"] != "/go/pkg" || got[1]["to"] != "/Users/me/go/pkg" {
+	if got[1]["from"] != "/Users/me/go/pkg" || got[1]["to"] != "/go/pkg" {
 		t.Errorf("unexpected second mapping: %v", got[1])
 	}
 }

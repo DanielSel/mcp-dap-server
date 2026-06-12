@@ -54,7 +54,7 @@ Debugger selection (via 'debugger' parameter):
 
 Choose the debugger based on the language of the program being debugged: use 'delve' for Go, use 'gdb' for C/C++/Rust.
 
-Remote debugging: set 'address' (host:port) to connect to an already-running DAP server (e.g. 'dlv dap --listen=:PORT' in a container reached via kubectl port-forward) instead of spawning a local debugger. The 'mode' still selects what to do once connected — interpreted on the remote host: 'binary' launches the remote 'path', 'attach' attaches to the remote 'processId'. When connecting remotely, 'path'/'processId'/'breakpoints' refer to the remote filesystem; use 'substitutePath' to map remote build paths to your local source paths so breakpoints bind.
+Remote debugging: set 'address' (host:port) to connect to an already-running DAP server (e.g. 'dlv dap --listen=:PORT' in a container reached via kubectl port-forward) instead of spawning a local debugger. The 'mode' still selects what to do once connected — interpreted on the remote host: 'binary' launches the remote 'path', 'attach' attaches to the remote 'processId'. When connecting remotely, 'path'/'processId'/'breakpoints' refer to the remote filesystem; use 'substitutePath' (from = your local path, to = the path compiled into the remote binary) so breakpoints set by local path bind.
 
 By default, when stopped at a breakpoint returns a compact stop summary (location only). Set fullContext: true only if you need variables immediately — leave it false unless you plan to call 'context' right after anyway.`
 
@@ -216,12 +216,16 @@ type BreakpointSpec struct {
 	Function string `json:"function,omitempty"`
 }
 
-// PathMapping maps a source path as compiled on the remote/build host to the
-// equivalent path on the machine running the MCP client. Used for remote
-// debugging where build paths differ from local checkout paths.
+// PathMapping maps a source path between the local machine running the MCP
+// client and the path compiled into the remote/build binary, so breakpoints set
+// by local path bind against the binary's (differing) build paths. This mirrors
+// Delve's "substitutePath" semantics exactly: From is the local/client path
+// (where you set breakpoints), To is the path baked into the binary. Delve
+// rewrites a breakpoint's From prefix to To to match the binary's debug info,
+// and reverses the mapping when reporting locations back.
 type PathMapping struct {
-	From string `json:"from" mcp:"source path as compiled on the remote/build host (e.g. /build/src)"`
-	To   string `json:"to" mcp:"equivalent local path the MCP client uses (e.g. /Users/me/project)"`
+	From string `json:"from" mcp:"path prefix on the LOCAL machine running the MCP client — where you set breakpoints (e.g. /Users/me/project)"`
+	To   string `json:"to" mcp:"equivalent path prefix compiled into the REMOTE binary — what 'context' shows before mapping (e.g. /build/src)"`
 }
 
 // DebugParams defines the parameters for starting a complete debug session.
@@ -235,7 +239,7 @@ type DebugParams struct {
 	StopOnEntry    bool             `json:"stopOnEntry,omitempty" mcp:"stop at program entry instead of running to first breakpoint"`
 	Port           string           `json:"port,omitempty" mcp:"port for the locally-spawned DAP server (default: auto-assigned); ignored when 'address' is set"`
 	Address        string           `json:"address,omitempty" mcp:"host:port of an already-running DAP server to connect to (e.g. a remote 'dlv dap --listen'). When set, no local debugger is spawned; mode/path/processId are interpreted on the remote host"`
-	SubstitutePath []PathMapping    `json:"substitutePath,omitempty" mcp:"source path mappings (Delve only) so breakpoints set by local path bind to remote build paths"`
+	SubstitutePath []PathMapping    `json:"substitutePath,omitempty" mcp:"source path mappings (Delve only): each entry's 'from' is your LOCAL path and 'to' is the path compiled into the REMOTE binary, so breakpoints set by local path bind to the binary's build paths"`
 	Debugger       string           `json:"debugger,omitempty" mcp:"debugger to use: 'delve' (default) or 'gdb'"`
 	GDBPath        string           `json:"gdbPath,omitempty" mcp:"path to gdb binary (default: auto-detected from PATH). Requires GDB 14+."`
 	ProtocolLog    string           `json:"protocolLog,omitempty" mcp:"file path for protocol-level DAP message logging (what the MCP server sends/receives)"`
