@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "dap-debugger": {
+      "command": "go",
+      "args": ["run", "."],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}"
+    }
+  }
+}

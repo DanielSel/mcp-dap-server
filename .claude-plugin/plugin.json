@@ -1,0 +1,12 @@
+{
+  "name": "dap-debugger",
+  "description": "Debug Go (and C/C++) programs via the Debug Adapter Protocol, including connecting to a remote dlv DAP server running in a container.",
+  "author": {
+    "name": "Relain"
+  },
+  "homepage": "https://github.com/go-delve/mcp-dap-server",
+  "repository": "https://github.com/DanielSel/mcp-dap-server",
+  "license": "MIT",
+  "keywords": ["debugging", "dap", "delve", "go", "gdb", "remote", "kubernetes"],
+  "commands": "./skills"
+}
