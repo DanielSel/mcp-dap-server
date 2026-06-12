@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -1688,5 +1689,138 @@ func TestErrorBeforeDebuggerStarted(t *testing.T) {
 				t.Logf("Got expected error for %s: %v", tt.name, err)
 			}
 		})
+	}
+}
+
+// startRemoteDlvDap starts a standalone `dlv dap` server listening on an
+// auto-assigned port and returns its address. This simulates a remote DAP
+// server (e.g. one running in a container reached via kubectl port-forward)
+// that the MCP server connects to instead of spawning its own.
+func startRemoteDlvDap(t *testing.T) (addr string, cleanup func()) {
+	t.Helper()
+
+	cmd := exec.Command("dlv", "dap", "--listen", "127.0.0.1:0", "--only-same-user=false")
+	cmd.Stderr = io.Discard
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("Failed to create stdout pipe: %v", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("Failed to start dlv dap (is dlv installed?): %v", err)
+	}
+
+	r := bufio.NewReader(stdout)
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			cmd.Process.Kill()
+			cmd.Wait()
+			t.Fatalf("Failed waiting for dlv dap listen address: %v", err)
+		}
+		if strings.HasPrefix(line, "DAP server listening at") {
+			parts := strings.SplitN(line, ": ", 2)
+			if len(parts) == 2 {
+				addr = strings.TrimSpace(parts[1])
+			}
+			break
+		}
+	}
+	if addr == "" {
+		cmd.Process.Kill()
+		cmd.Wait()
+		t.Fatalf("Could not parse dlv dap listen address")
+	}
+
+	return addr, func() {
+		cmd.Process.Kill()
+		cmd.Wait()
+	}
+}
+
+// TestRemoteConnect verifies the MCP server can connect to an already-running
+// remote DAP server via the 'address' parameter (no local debugger spawned),
+// launch a binary on it, hit a breakpoint, and inspect state.
+func TestRemoteConnect(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	binaryPath, cleanupBinary := compileTestProgram(t, ts.cwd, "helloworld")
+	defer cleanupBinary()
+
+	addr, cleanupDlv := startRemoteDlvDap(t)
+	defer cleanupDlv()
+
+	// Connect to the remote DAP server instead of spawning one locally.
+	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name: "debug",
+		Arguments: map[string]any{
+			"mode":    "binary",
+			"path":    binaryPath,
+			"address": addr,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Failed to start remote debug session: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("Remote debug session returned error: %v", result.Content)
+	}
+
+	// Breakpoints resolve directly here because the remote dlv shares this
+	// filesystem (same host); substitutePath would be needed across hosts.
+	f := filepath.Join(ts.cwd, "testdata", "go", "helloworld", "main.go")
+	ts.setBreakpointAndContinue(t, f, 7)
+
+	contextStr := ts.getContextContent(t)
+	if !strings.Contains(contextStr, "main.main") {
+		t.Errorf("Expected context to contain 'main.main', got: %s", contextStr)
+	}
+	if !strings.Contains(contextStr, "main.go") {
+		t.Errorf("Expected context to contain 'main.go', got: %s", contextStr)
+	}
+
+	// stop() on a remote session detaches by default; the dlv dap process then
+	// exits on its own and cleanupDlv reaps it.
+	ts.stopDebugger(t)
+}
+
+// TestRemoteInvalidAddress verifies a malformed 'address' is rejected before any
+// connection attempt, without needing a real DAP server.
+func TestRemoteInvalidAddress(t *testing.T) {
+	ts := setupMCPServerAndClient(t)
+	defer ts.cleanup()
+
+	result, err := ts.session.CallTool(ts.ctx, &mcp.CallToolParams{
+		Name: "debug",
+		Arguments: map[string]any{
+			"mode":    "binary",
+			"path":    "/tmp/whatever",
+			"address": "not-a-valid-address",
+		},
+	})
+	if err != nil {
+		// A transport-level error is also an acceptable rejection.
+		return
+	}
+	if !result.IsError {
+		t.Fatalf("Expected error for invalid address, got success: %v", result.Content)
+	}
+}
+
+// TestSubstitutePathArg verifies path mappings are converted into the
+// array-of-objects shape Delve expects.
+func TestSubstitutePathArg(t *testing.T) {
+	got := substitutePathArg([]PathMapping{
+		{From: "/build", To: "/Users/me/project"},
+		{From: "/go/pkg", To: "/Users/me/go/pkg"},
+	})
+	if len(got) != 2 {
+		t.Fatalf("expected 2 mappings, got %d", len(got))
+	}
+	if got[0]["from"] != "/build" || got[0]["to"] != "/Users/me/project" {
+		t.Errorf("unexpected first mapping: %v", got[0])
+	}
+	if got[1]["from"] != "/go/pkg" || got[1]["to"] != "/Users/me/go/pkg" {
+		t.Errorf("unexpected second mapping: %v", got[1])
 	}
 }

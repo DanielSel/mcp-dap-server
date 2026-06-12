@@ -29,6 +29,7 @@ The MCP DAP Server acts as a bridge between MCP clients and DAP-compatible debug
 - **Full State Inspection**: Stack traces, scopes, and variables in one call
 - **Expression Evaluation**: Evaluate and modify variables in context
 - **Process Attachment**: Attach to running processes
+- **Remote Debugging**: Connect to a remote DAP server (e.g. `dlv dap` in a container) instead of spawning one locally
 - **Disassembly Support**: View disassembled code at memory addresses
 
 ## Installation
@@ -92,7 +93,9 @@ Start a debugging session. Supports four modes:
 - `processId` (number): Process ID (required for attach mode)
 - `breakpoints` (array): Breakpoints to set before running (file:line or function name)
 - `stopOnEntry` (boolean): Stop at program entry point
-- `port` (number): DAP server port
+- `port` (number): Port for the locally-spawned DAP server (ignored when `address` is set)
+- `address` (string): `host:port` of an already-running DAP server to connect to (e.g. a remote `dlv dap --listen`). When set, no local debugger is spawned; `mode`/`path`/`processId` are interpreted on the remote host. See [Remote debugging](#remote-debugging-kubernetes-containers).
+- `substitutePath` (array): Source path mappings (Delve only), each `{ "from": "<remote build path>", "to": "<local path>" }`, so breakpoints set by local path bind to the remote binary's build paths.
 
 Returns full context (location, stack trace, variables) when stopped.
 
@@ -174,6 +177,77 @@ Disassemble code at a memory address.
   - `memoryReference` (string): Memory address
   - `instructionOffset` (number, optional): Offset from address
   - `instructionCount` (number): Number of instructions to disassemble
+
+## Remote debugging (Kubernetes containers)
+
+Instead of spawning a debugger locally, the `debug` tool can **connect to a DAP
+server that is already running elsewhere** by passing `address` (`host:port`).
+This is the recommended way to debug a Go binary running in a remote container:
+the container runs `dlv dap`, you forward its port to your machine, and the MCP
+server dials it. The full tool surface (breakpoints, stepping, variables, eval,
+disassemble) works identically over the connection.
+
+### 1. Run a DAP server in the debug image
+
+```dockerfile
+# Build the binary with debug info (no inlining/optimization):
+#   go build -gcflags=all="-N -l" -o /app/server .
+ENTRYPOINT ["dlv", "dap", "--listen=:40000", "--only-same-user=false", "--api-version=2"]
+```
+
+`--only-same-user=false` is required because the connection arrives over TCP.
+`dlv dap` serves a single client and exits when the session ends — fine for an
+on-demand debug pod.
+
+### 2. Expose the port
+
+```bash
+kubectl port-forward pod/my-pod 40000:40000
+```
+
+### 3. Connect and debug
+
+```json
+{
+  "mode": "binary",
+  "path": "/app/server",
+  "address": "127.0.0.1:40000",
+  "substitutePath": [
+    { "from": "/build", "to": "/Users/me/project" }
+  ]
+}
+```
+
+- `path` (and `processId` for `mode: "attach"`) refer to the **remote** filesystem.
+- `stop` on a remote session **detaches by default** (it won't kill the remote
+  workload); pass `terminate=true` to force termination.
+
+### `substitutePath`: making breakpoints bind
+
+A breakpoint set by your **local** file path only binds if that path matches the
+**build path** compiled into the remote binary. In CI these usually differ, so
+breakpoints silently fail to verify. `substitutePath` maps one to the other.
+
+Example: CI built the binary under `/build`, your checkout is at
+`/Users/me/project`:
+
+```json
+"substitutePath": [
+  { "from": "/build", "to": "/Users/me/project" }
+]
+```
+
+Now a local breakpoint at `/Users/me/project/main.go:42` resolves to the remote
+`/build/main.go:42`. To discover the remote build path, connect first and look at
+the `File:` path printed by `context()` — that is the path the binary knows; map
+your local root onto it. Omit `substitutePath` entirely when the paths already
+match (e.g. the remote debugger shares your filesystem).
+
+> Need reconnect / detach-and-reattach, or the app to keep running whether or not
+> a debugger is attached? Run the remote as
+> `dlv --headless --listen=:40000 --accept-multiclient ... exec /app/server`
+> instead. Direct-dial via `address` targets `dlv dap`; a future `connect` mode
+> will target headless servers.
 
 ## Contributing
 

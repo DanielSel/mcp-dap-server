@@ -45,6 +45,19 @@ func registerPrompts(server *mcp.Server) {
 			{Name: "path", Required: true, Description: "Path to the compiled binary to debug"},
 		},
 	}, promptDebugBinary)
+
+	server.AddPrompt(&mcp.Prompt{
+		Name:        "debug-remote",
+		Description: "Structured workflow for debugging a Go binary in a remote container via a remote dlv DAP server",
+		Arguments: []*mcp.PromptArgument{
+			{Name: "address", Required: true, Description: "host:port of the remote DAP server (e.g. a kubectl port-forwarded 'dlv dap --listen'), e.g. '127.0.0.1:40000'"},
+			{Name: "remote_path", Required: false, Description: "Path to the binary on the remote host (for 'binary' mode), e.g. '/app/server'"},
+			{Name: "pid", Required: false, Description: "Remote process ID to attach to (for 'attach' mode), e.g. '1'"},
+			{Name: "local_source", Required: false, Description: "Local source root the MCP client uses, e.g. '/Users/me/project'"},
+			{Name: "remote_source", Required: false, Description: "Source root compiled into the remote binary, e.g. '/build'"},
+			{Name: "breakpoints", Required: false, Description: "Comma-separated file:line pairs (local paths), e.g. 'main.go:42'"},
+		},
+	}, promptDebugRemote)
 }
 
 func promptDebugSource(_ context.Context, req *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
@@ -335,12 +348,12 @@ func promptDebugCoreDump(_ context.Context, req *mcp.GetPromptRequest) (*mcp.Get
 
 	signalGuide := `
 **Signal interpretation:**
-- `+"`"+`SIGSEGV`+"`"+` (segfault) — nil pointer dereference, use-after-free, buffer overflow, stack overflow
-- `+"`"+`SIGABRT`+"`"+` — explicit abort, assertion failure, double-free (C/C++), runtime panic (Go)
-- `+"`"+`SIGFPE`+"`"+` — arithmetic error: division by zero, integer overflow
-- `+"`"+`SIGBUS`+"`"+` — misaligned memory access, unmapped file region
-- `+"`"+`SIGILL`+"`"+` — illegal CPU instruction (often compiler bug or corrupted binary)
-- `+"`"+`SIGPIPE`+"`"+` — write to closed pipe/socket with no signal handler`
+- ` + "`" + `SIGSEGV` + "`" + ` (segfault) — nil pointer dereference, use-after-free, buffer overflow, stack overflow
+- ` + "`" + `SIGABRT` + "`" + ` — explicit abort, assertion failure, double-free (C/C++), runtime panic (Go)
+- ` + "`" + `SIGFPE` + "`" + ` — arithmetic error: division by zero, integer overflow
+- ` + "`" + `SIGBUS` + "`" + ` — misaligned memory access, unmapped file region
+- ` + "`" + `SIGILL` + "`" + ` — illegal CPU instruction (often compiler bug or corrupted binary)
+- ` + "`" + `SIGPIPE` + "`" + ` — write to closed pipe/socket with no signal handler`
 
 	content := fmt.Sprintf(`## Post-Mortem Core Dump Analysis
 
@@ -460,8 +473,8 @@ func promptDebugBinary(_ context.Context, req *mcp.GetPromptRequest) (*mcp.GetPr
 
 	// Infer likely language/debugger from path or note that both are supported
 	debuggerNote := `Use 'delve' for Go binaries, 'gdb' for C/C++/Rust binaries.
-> - Go binary: `+"`"+`debug(mode="binary", path="...", debugger="delve")`+"`"+`
-> - C/C++ binary: `+"`"+`debug(mode="binary", path="...", debugger="gdb")`+"`"+``
+> - Go binary: ` + "`" + `debug(mode="binary", path="...", debugger="delve")` + "`" + `
+> - C/C++ binary: ` + "`" + `debug(mode="binary", path="...", debugger="gdb")` + "`" + ``
 
 	content := fmt.Sprintf(`## Binary / Assembly-Level Debug Session
 
@@ -582,6 +595,143 @@ Call: `+"`"+`stop()`+"`"+`
 
 	return &mcp.GetPromptResult{
 		Description: fmt.Sprintf("Assembly-level binary debugging workflow for %s", path),
+		Messages: []*mcp.PromptMessage{
+			{Role: "user", Content: &mcp.TextContent{Text: content}},
+		},
+	}, nil
+}
+
+func promptDebugRemote(_ context.Context, req *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+	address := req.Params.Arguments["address"]
+	remotePath := req.Params.Arguments["remote_path"]
+	pid := req.Params.Arguments["pid"]
+	localSource := req.Params.Arguments["local_source"]
+	remoteSource := req.Params.Arguments["remote_source"]
+	breakpoints := req.Params.Arguments["breakpoints"]
+
+	// Decide which mode the worked example uses.
+	mode := "binary"
+	target := fmt.Sprintf(`"path": "%s"`, remotePath)
+	if remotePath == "" {
+		remotePath = "/app/server"
+	}
+	if pid != "" {
+		mode = "attach"
+		target = fmt.Sprintf(`"processId": %s`, pid)
+	} else {
+		target = fmt.Sprintf(`"path": "%s"`, remotePath)
+	}
+
+	// Build the substitutePath example. Use the provided roots if any, else
+	// illustrative placeholders, so the user always sees a concrete mapping.
+	exFrom := remoteSource
+	exTo := localSource
+	if exFrom == "" {
+		exFrom = "/build"
+	}
+	if exTo == "" {
+		exTo = "/Users/me/project"
+	}
+
+	content := fmt.Sprintf(`## Remote Debug Session (Go binary in a container)
+
+You are debugging a Go program that runs under a **remote dlv DAP server** — for
+example a Kubernetes pod whose debug image runs `+"`"+`dlv dap --listen=:40000 --only-same-user=false`+"`"+`,
+reached from this machine via `+"`"+`kubectl port-forward`+"`"+`.
+
+**Remote DAP address:** `+"`"+`%s`+"`"+`
+
+> No local debugger is spawned. The MCP server dials the address and drives the
+> remote dlv. `+"`"+`path`+"`"+`/`+"`"+`processId`+"`"+` are interpreted on the **remote** host.
+
+---
+
+### Step 0 (outside this tool): expose the remote port
+
+`+"```"+`bash
+# Run the debug image so dlv waits for a DAP client:
+#   ENTRYPOINT ["dlv","dap","--listen=:40000","--only-same-user=false","--api-version=2"]
+kubectl port-forward pod/my-pod 40000:40000
+`+"```"+`
+
+This makes the remote DAP server reachable at `+"`"+`127.0.0.1:40000`+"`"+`.
+
+---
+
+### Step 1: Connect and start debugging
+
+Call: `+"`"+`debug(mode="%s", address="%s", %s, substitutePath=[{"from": "%s", "to": "%s"}])`+"`"+`
+
+JSON form:
+`+"```"+`json
+{
+  "mode": "%s",
+  "address": "%s",
+  %s,
+  "substitutePath": [
+    { "from": "%s", "to": "%s" }
+  ]
+}
+`+"```"+`
+
+**Why `+"`"+`substitutePath`+"`"+` matters:** breakpoints you set by your *local* file
+path must match the *build* paths compiled into the remote binary. If your CI
+built the binary under `+"`"+`%s`+"`"+` but your checkout lives at `+"`"+`%s`+"`"+`, the mapping
+above lets a local breakpoint like `+"`"+`%s/main.go:42`+"`"+` bind to the remote
+`+"`"+`%s/main.go:42`+"`"+`. Omit it only if the paths are already identical.
+
+> To find the remote build path, run `+"`"+`evaluate(expression="runtime.GOROOT()")`+"`"+`
+> after connecting, or inspect a stack frame's `+"`"+`File:`+"`"+` line from `+"`"+`context()`+"`"+` —
+> that is the path the binary knows. Map your local root onto it.
+
+---
+
+### Step 2: Set breakpoints (local paths)
+%s
+Call: `+"`"+`breakpoint(file="%s/main.go", line=42)`+"`"+`
+
+With `+"`"+`substitutePath`+"`"+` in place, the breakpoint resolves on the remote binary.
+If a breakpoint reports "not verified", the path mapping is likely wrong — verify
+the `+"`"+`File:`+"`"+` path shown by `+"`"+`context()`+"`"+` and adjust `+"`"+`from`+"`"+`/`+"`"+`to`+"`"+`.
+
+---
+
+### Step 3: Run and inspect
+
+Call: `+"`"+`continue()`+"`"+`, then `+"`"+`context()`+"`"+`, `+"`"+`evaluate(...)`+"`"+`, and
+`+"`"+`step(...)`+"`"+` exactly as in a local session — the full tool surface works
+identically over the remote connection.
+
+---
+
+### Step 4: Disconnect safely
+
+Call: `+"`"+`stop()`+"`"+`
+
+For a remote (`+"`"+`address`+"`"+`) session this **detaches by default** so the remote
+workload is not killed. To force termination of the remote debuggee, call
+`+"`"+`stop(terminate=true)`+"`"+`.
+
+> Note: `+"`"+`dlv dap`+"`"+` serves a single connection and exits when the session ends.
+> To reconnect repeatedly or keep the app running independently of the debugger,
+> run the remote as `+"`"+`dlv --headless --accept-multiclient`+"`"+` instead (a future
+> 'connect' mode will target that setup).
+`,
+		address,
+		mode, address, target, exFrom, exTo,
+		mode, address, target, exFrom, exTo,
+		exFrom, exTo, exTo, exFrom,
+		func() string {
+			if breakpoints != "" {
+				return fmt.Sprintf("\nRequested breakpoints: `%s`\n", breakpoints)
+			}
+			return ""
+		}(),
+		exTo,
+	)
+
+	return &mcp.GetPromptResult{
+		Description: fmt.Sprintf("Remote debugging workflow via %s", address),
 		Messages: []*mcp.PromptMessage{
 			{Role: "user", Content: &mcp.TextContent{Text: content}},
 		},

@@ -3,7 +3,7 @@ name: debug-attach
 description: |
   Live debugging by attaching to a running process using mcp-dap-server.
   TRIGGER when: user asks to debug a running process, diagnose a live process by PID, attach to an already-running program, or investigate live CPU/memory/deadlock issues.
-  DO NOT TRIGGER when: debugging from source (use debug-source), analyzing a crash dump (use debug-core-dump), or the process hasn't started yet (use debug-source or debug-binary).
+  DO NOT TRIGGER when: debugging from source (use debug-source), analyzing a crash dump (use debug-core-dump), the process hasn't started yet (use debug-source or debug-binary), or the debugger runs remotely / in a container reached by host:port (use debug-remote).
 ---
 
 # Live Attach Debug Workflow

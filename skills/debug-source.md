@@ -3,7 +3,7 @@ name: debug-source
 description: |
   Live source-level debugging of a Go or C/C++ program using mcp-dap-server.
   TRIGGER when: user asks to debug a program from source, find a bug, step through code, or inspect runtime state of a running program.
-  DO NOT TRIGGER when: debugging a core dump (use debug-core-dump), attaching to an existing process (use debug-attach), or debugging a binary without source (use debug-binary).
+  DO NOT TRIGGER when: debugging a core dump (use debug-core-dump), attaching to an existing process (use debug-attach), debugging a binary without source (use debug-binary), or connecting to a debugger running remotely / in a container by host:port (use debug-remote).
 ---
 
 # Live Source Debug Workflow

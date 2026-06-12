@@ -17,7 +17,7 @@ This is an MCP (Model Context Protocol) server that bridges MCP clients with DAP
 - Exposes stdio transport
 
 **prompts.go**: MCP prompt implementations
-- 4 prompt handlers for guided debugging workflows (source, attach, core dump, binary)
+- 5 prompt handlers for guided debugging workflows (source, attach, core dump, binary, remote)
 - Registered via `server.AddPrompt()` — no session state, always available
 - Each prompt returns a `GetPromptResult` with step-by-step tool invocation guidance
 
@@ -213,7 +213,7 @@ func TestSomething(t *testing.T) {
 
 ### MCP Prompts
 
-The server exposes 4 prompts (via `prompts/list` and `prompts/get`) that return guided debugging workflows:
+The server exposes 5 prompts (via `prompts/list` and `prompts/get`) that return guided debugging workflows:
 
 | Prompt | Required Args | Use for |
 |--------|--------------|---------|
@@ -221,12 +221,13 @@ The server exposes 4 prompts (via `prompts/list` and `prompts/get`) that return 
 | `debug-attach` | `pid` | Attaching to a running process |
 | `debug-core-dump` | `binary_path`, `core_path` | Post-mortem crash analysis |
 | `debug-binary` | `path` | Assembly-level binary debugging |
+| `debug-remote` | `address` | Debugging a Go binary in a remote container via a remote `dlv dap` server |
 
 Prompts are registered in `prompts.go` via `registerPrompts()`, called from `main.go`.
 
 ### Claude Code Skills
 
-Four skills live in `skills/` for use with the Claude Code Superpowers plugin:
+Five skills live in `skills/` for use with the Claude Code Superpowers plugin:
 
 | Skill file | Trigger |
 |-----------|---------|
@@ -234,6 +235,7 @@ Four skills live in `skills/` for use with the Claude Code Superpowers plugin:
 | `debug-attach.md` | Attaching to a running process |
 | `debug-core-dump.md` | Analyzing a core dump |
 | `debug-binary.md` | Assembly-level binary debugging |
+| `debug-remote.md` | Debugging a Go binary in a remote container via a remote `dlv dap` server |
 
 To register skills with Claude Code, configure the `skills/` directory as a skills source in your Superpowers plugin settings.
 

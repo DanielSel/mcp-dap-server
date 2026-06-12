@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -16,7 +17,7 @@ import (
 )
 
 type debuggerSession struct {
-	mu              sync.Mutex       // serializes DAP requests to prevent concurrent read races
+	mu              sync.Mutex // serializes DAP requests to prevent concurrent read races
 	cmd             *exec.Cmd
 	client          *DAPClient
 	server          *mcp.Server      // MCP server for dynamic tool registration
@@ -30,6 +31,7 @@ type debuggerSession struct {
 	stoppedThreadID int              // thread ID from last StoppedEvent (for adapters that use non-sequential IDs)
 	lastFrameID     int              // frame ID from last getFullContext; -1 means not set (0 is valid for GDB)
 	protocolLogFile *os.File         // protocol log file (closed on cleanup)
+	remote          bool             // true when connected to a remote DAP server (no local adapter spawned)
 }
 
 // defaultThreadID returns the thread ID to use when none is specified.
@@ -50,6 +52,8 @@ Debugger selection (via 'debugger' parameter):
 - 'gdb': For C/C++/Rust and other compiled languages. Requires GDB 14+ with native DAP support (gdb -i dap). GDB does not support 'source' mode; compile your program with debug symbols (gcc -g -O0) and use 'binary' mode.
 
 Choose the debugger based on the language of the program being debugged: use 'delve' for Go, use 'gdb' for C/C++/Rust.
+
+Remote debugging: set 'address' (host:port) to connect to an already-running DAP server (e.g. 'dlv dap --listen=:PORT' in a container reached via kubectl port-forward) instead of spawning a local debugger. The 'mode' still selects what to do once connected — interpreted on the remote host: 'binary' launches the remote 'path', 'attach' attaches to the remote 'processId'. When connecting remotely, 'path'/'processId'/'breakpoints' refer to the remote filesystem; use 'substitutePath' to map remote build paths to your local source paths so breakpoints bind.
 
 By default, when stopped at a breakpoint returns a compact stop summary (location only). Set fullContext: true only if you need variables immediately — leave it false unless you plan to call 'context' right after anyway.`
 
@@ -211,21 +215,41 @@ type BreakpointSpec struct {
 	Function string `json:"function,omitempty"`
 }
 
+// PathMapping maps a source path as compiled on the remote/build host to the
+// equivalent path on the machine running the MCP client. Used for remote
+// debugging where build paths differ from local checkout paths.
+type PathMapping struct {
+	From string `json:"from" mcp:"source path as compiled on the remote/build host (e.g. /build/src)"`
+	To   string `json:"to" mcp:"equivalent local path the MCP client uses (e.g. /Users/me/project)"`
+}
+
 // DebugParams defines the parameters for starting a complete debug session.
 type DebugParams struct {
-	Mode         string           `json:"mode" mcp:"'source' (compile & debug), 'binary' (debug executable), 'core' (debug core dump), or 'attach' (connect to process)"`
-	Path         string           `json:"path,omitempty" mcp:"program path (required for source/binary modes; optional for core mode with GDB, which can auto-detect it)"`
-	Args         []string         `json:"args,omitempty" mcp:"command line arguments for the program"`
-	CoreFilePath string           `json:"coreFilePath,omitempty" mcp:"path to core dump file (required for core mode)"`
-	ProcessID    int              `json:"processId,omitempty" mcp:"process ID (required for attach mode)"`
-	Breakpoints  []BreakpointSpec `json:"breakpoints,omitempty" mcp:"initial breakpoints"`
-	StopOnEntry  bool             `json:"stopOnEntry,omitempty" mcp:"stop at program entry instead of running to first breakpoint"`
-	Port         string           `json:"port,omitempty" mcp:"port for DAP server (default: auto-assigned)"`
-	Debugger    string `json:"debugger,omitempty" mcp:"debugger to use: 'delve' (default) or 'gdb'"`
-	GDBPath     string `json:"gdbPath,omitempty" mcp:"path to gdb binary (default: auto-detected from PATH). Requires GDB 14+."`
-	ProtocolLog string `json:"protocolLog,omitempty" mcp:"file path for protocol-level DAP message logging (what the MCP server sends/receives)"`
-	ToolLog     string `json:"toolLog,omitempty" mcp:"file path for tool-level DAP logging (native debugger logging, GDB only)"`
-	FullContext bool   `json:"fullContext,omitempty" mcp:"if true, return full context (stack trace and variables) when stopped at a breakpoint; if false (default), return a compact stop summary — leave false unless you need variables immediately"`
+	Mode           string           `json:"mode" mcp:"'source' (compile & debug), 'binary' (debug executable), 'core' (debug core dump), or 'attach' (connect to process)"`
+	Path           string           `json:"path,omitempty" mcp:"program path (required for source/binary modes; optional for core mode with GDB, which can auto-detect it)"`
+	Args           []string         `json:"args,omitempty" mcp:"command line arguments for the program"`
+	CoreFilePath   string           `json:"coreFilePath,omitempty" mcp:"path to core dump file (required for core mode)"`
+	ProcessID      int              `json:"processId,omitempty" mcp:"process ID (required for attach mode)"`
+	Breakpoints    []BreakpointSpec `json:"breakpoints,omitempty" mcp:"initial breakpoints"`
+	StopOnEntry    bool             `json:"stopOnEntry,omitempty" mcp:"stop at program entry instead of running to first breakpoint"`
+	Port           string           `json:"port,omitempty" mcp:"port for the locally-spawned DAP server (default: auto-assigned); ignored when 'address' is set"`
+	Address        string           `json:"address,omitempty" mcp:"host:port of an already-running DAP server to connect to (e.g. a remote 'dlv dap --listen'). When set, no local debugger is spawned; mode/path/processId are interpreted on the remote host"`
+	SubstitutePath []PathMapping    `json:"substitutePath,omitempty" mcp:"source path mappings (Delve only) so breakpoints set by local path bind to remote build paths"`
+	Debugger       string           `json:"debugger,omitempty" mcp:"debugger to use: 'delve' (default) or 'gdb'"`
+	GDBPath        string           `json:"gdbPath,omitempty" mcp:"path to gdb binary (default: auto-detected from PATH). Requires GDB 14+."`
+	ProtocolLog    string           `json:"protocolLog,omitempty" mcp:"file path for protocol-level DAP message logging (what the MCP server sends/receives)"`
+	ToolLog        string           `json:"toolLog,omitempty" mcp:"file path for tool-level DAP logging (native debugger logging, GDB only)"`
+	FullContext    bool             `json:"fullContext,omitempty" mcp:"if true, return full context (stack trace and variables) when stopped at a breakpoint; if false (default), return a compact stop summary — leave false unless you need variables immediately"`
+}
+
+// substitutePathArg converts path mappings into the array-of-objects shape that
+// Delve's DAP launch/attach arguments expect for "substitutePath".
+func substitutePathArg(mappings []PathMapping) []map[string]string {
+	out := make([]map[string]string, len(mappings))
+	for i, m := range mappings {
+		out[i] = map[string]string{"from": m.From, "to": m.To}
+	}
+	return out
 }
 
 // ContextParams defines the parameters for getting debugging context.
@@ -332,7 +356,8 @@ type ClearBreakpointsParams struct {
 
 // StopParams defines parameters for stopping the debug session.
 type StopParams struct {
-	Detach bool `json:"detach,omitempty" mcp:"if true, detach from the process without terminating it (leaves the debuggee running); default false terminates the debuggee"`
+	Detach    bool `json:"detach,omitempty" mcp:"if true, detach from the process without terminating it (leaves the debuggee running). For remote (address) sessions this is the default; for local sessions the default terminates the debuggee"`
+	Terminate bool `json:"terminate,omitempty" mcp:"if true, terminate the debuggee even for a remote (address) session, overriding the safe detach default"`
 }
 
 // clearBreakpoints removes breakpoints.
@@ -539,8 +564,8 @@ func (ds *debuggerSession) evaluateExpression(ctx context.Context, _ *mcp.CallTo
 // SetVariableParams defines the parameters for setting a variable.
 type SetVariableParams struct {
 	VariablesReference FlexInt `json:"variablesReference" mcp:"reference to the variable container"`
-	Name               string `json:"name" mcp:"name of the variable to set"`
-	Value              string `json:"value" mcp:"new value for the variable"`
+	Name               string  `json:"name" mcp:"name of the variable to set"`
+	Value              string  `json:"value" mcp:"new value for the variable"`
 }
 
 // setVariable sets the value of a variable in the debugged program.
@@ -774,7 +799,14 @@ func (ds *debuggerSession) stop(ctx context.Context, _ *mcp.CallToolRequest, par
 		}, nil, nil
 	}
 
-	if params.Detach && ds.client != nil {
+	// Remote (address) sessions default to detach so we never kill a workload we
+	// merely connected to; an explicit terminate=true overrides that.
+	detach := params.Detach
+	if ds.remote && !params.Terminate {
+		detach = true
+	}
+
+	if detach && ds.client != nil {
 		// Send disconnect with terminateDebuggee=false so the debuggee keeps running.
 		seq, err := ds.client.DisconnectRequest(false)
 		if err != nil {
@@ -826,6 +858,7 @@ func (ds *debuggerSession) cleanup() {
 	ds.capabilities = dap.Capabilities{}
 	ds.stoppedThreadID = 0
 	ds.lastFrameID = -1
+	ds.remote = false
 	ds.unregisterSessionTools()
 }
 
@@ -900,30 +933,45 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 		return nil, nil, fmt.Errorf("path is required for core mode with %s (only GDB can auto-detect the executable from a core file)", debugger)
 	}
 
-	// Spawn DAP server via backend
-	cmd, listenAddr, err := ds.backend.Spawn(port, ds.logWriter)
-	if err != nil {
-		return nil, nil, err
-	}
-	ds.cmd = cmd
-
-	// Connect DAP client based on transport mode
-	switch ds.backend.TransportMode() {
-	case "tcp":
-		client, err := newDAPClient(listenAddr)
+	if params.Address != "" {
+		// Remote: connect to an already-running DAP server instead of spawning
+		// one. No local process is started; cleanup tolerates ds.cmd == nil and
+		// only closes the client (we never kill the remote debugger).
+		if _, _, err := net.SplitHostPort(params.Address); err != nil {
+			return nil, nil, fmt.Errorf("invalid address %q (expected host:port): %w", params.Address, err)
+		}
+		client, err := newDAPClient(params.Address)
 		if err != nil {
 			return nil, nil, err
 		}
 		ds.client = client
-	case "stdio":
-		gdb := ds.backend.(*gdbBackend)
-		stdout, stdin := gdb.StdioPipes()
-		ds.client = newDAPClientFromRWC(&readWriteCloser{
-			Reader:      stdout,
-			WriteCloser: stdin,
-		})
-	default:
-		return nil, nil, fmt.Errorf("unsupported transport mode: %s", ds.backend.TransportMode())
+		ds.remote = true
+	} else {
+		// Spawn DAP server via backend
+		cmd, listenAddr, err := ds.backend.Spawn(port, ds.logWriter)
+		if err != nil {
+			return nil, nil, err
+		}
+		ds.cmd = cmd
+
+		// Connect DAP client based on transport mode
+		switch ds.backend.TransportMode() {
+		case "tcp":
+			client, err := newDAPClient(listenAddr)
+			if err != nil {
+				return nil, nil, err
+			}
+			ds.client = client
+		case "stdio":
+			gdb := ds.backend.(*gdbBackend)
+			stdout, stdin := gdb.StdioPipes()
+			ds.client = newDAPClientFromRWC(&readWriteCloser{
+				Reader:      stdout,
+				WriteCloser: stdin,
+			})
+		default:
+			return nil, nil, fmt.Errorf("unsupported transport mode: %s", ds.backend.TransportMode())
+		}
 	}
 
 	// Protocol-level DAP message logging
@@ -950,12 +998,23 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 
 	// Launch or attach using backend-specific args
 	stopOnEntry := params.StopOnEntry || len(params.Breakpoints) == 0
+
+	// addSubstitutePath injects Delve source path mappings into the backend's
+	// argument map. Only Delve understands "substitutePath"; for other backends
+	// the mappings are ignored to avoid sending an unknown argument.
+	addSubstitutePath := func(args map[string]any) {
+		if len(params.SubstitutePath) > 0 && debugger == "delve" {
+			args["substitutePath"] = substitutePathArg(params.SubstitutePath)
+		}
+	}
+
 	switch mode {
 	case "source", "binary":
 		launchArgs, err := ds.backend.LaunchArgs(mode, params.Path, stopOnEntry, params.Args)
 		if err != nil {
 			return nil, nil, err
 		}
+		addSubstitutePath(launchArgs)
 		req := ds.client.newRequest("launch")
 		request := &dap.LaunchRequest{Request: *req}
 		request.Arguments = toRawMessage(launchArgs)
@@ -967,6 +1026,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 		if err != nil {
 			return nil, nil, err
 		}
+		addSubstitutePath(coreArgs)
 		rawArgs := toRawMessage(coreArgs)
 		var request dap.Message
 		if ds.backend.CoreRequestType() == "attach" {
@@ -986,6 +1046,7 @@ func (ds *debuggerSession) debug(ctx context.Context, _ *mcp.CallToolRequest, pa
 		if err != nil {
 			return nil, nil, err
 		}
+		addSubstitutePath(attachArgs)
 		req := ds.client.newRequest("attach")
 		request := &dap.AttachRequest{Request: *req}
 		request.Arguments = toRawMessage(attachArgs)

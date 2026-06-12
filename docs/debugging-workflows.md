@@ -11,6 +11,7 @@ This document provides guidance for choosing and executing the right debugging w
 | Attach to running process | `attach` | `delve` or `gdb` | `debug-attach` prompt / skill |
 | Analyze a crash (core dump) | `core` | `delve` or `gdb` | `debug-core-dump` prompt / skill |
 | Debug a compiled binary | `binary` | `delve` or `gdb` | `debug-binary` prompt / skill |
+| Debug a Go binary in a remote container | `binary` / `attach` + `address` | `delve` | `debug-remote` prompt |
 
 *GDB does not support compiling from source — compile with `gcc -g -O0` first.
 
@@ -142,6 +143,43 @@ flowchart TD
 
 ---
 
+### 5. Remote Debugging (Go binary in a container)
+
+Connect to a DAP server that is already running on another host instead of
+spawning one locally, by passing `address` (`host:port`). The remote runs
+`dlv dap`; you reach it over `kubectl port-forward` (or any TCP tunnel).
+
+```mermaid
+flowchart TD
+    A[Debug image runs 'dlv dap --listen :40000 --only-same-user=false'] --> B[kubectl port-forward pod 40000:40000]
+    B --> C[debug&#40;mode='binary', address='127.0.0.1:40000', path='/app/server', substitutePath=[...]&#41;]
+    C --> D[breakpoint&#40;file='local/main.go', line=42&#41;]
+    D --> E{Breakpoint verified?}
+    E -- no --> F[Fix substitutePath: map remote build path to local path]
+    F --> D
+    E -- yes --> G[continue&#40;&#41; / context&#40;&#41; / step&#40;&#41; — same as local]
+    G --> H[stop&#40;&#41; — detaches by default, remote workload survives]
+```
+
+**Key tools:** `debug` (with `address`), `breakpoint`, `continue`, `context`, `evaluate`, `step`, `stop`
+
+**Typical sequence:**
+1. Remote: `dlv dap --listen=:40000 --only-same-user=false --api-version=2` (built with `-gcflags=all="-N -l"`)
+2. `kubectl port-forward pod/my-pod 40000:40000`
+3. `debug(mode="binary", address="127.0.0.1:40000", path="/app/server", substitutePath=[{"from": "/build", "to": "/local/checkout"}])`
+   - Or attach to the in-container pid: `debug(mode="attach", address="127.0.0.1:40000", processId=1)`
+4. `breakpoint(file="/local/checkout/main.go", line=42)` — `substitutePath` makes it bind to the remote binary
+5. `continue()`, `context()`, `evaluate(...)` — identical to a local session
+6. `stop()` — detaches (does **not** kill the remote workload); `stop(terminate=true)` to force termination
+
+**Notes:**
+- `path` / `processId` are interpreted on the **remote** filesystem.
+- `dlv dap` serves one connection and exits when the session ends. For reconnect /
+  detach-and-reattach, or to keep the app running independently of the debugger,
+  run the remote as `dlv --headless --accept-multiclient ... exec /app/server`.
+
+---
+
 ## Common Gotchas
 
 ### GDB and C/C++
@@ -193,6 +231,7 @@ Use MCP prompts to get a guided workflow injected directly into your AI conversa
 | `debug-attach` | `pid`, `program?` | Attaching to a running process |
 | `debug-core-dump` | `binary_path`, `core_path`, `language?` | Analyzing a crash |
 | `debug-binary` | `path` | Debugging a compiled binary |
+| `debug-remote` | `address`, `remote_path?`, `pid?`, `local_source?`, `remote_source?`, `breakpoints?` | Debugging a Go binary in a remote container |
 
 To use a prompt from an MCP client:
 ```
@@ -207,5 +246,6 @@ If using Claude Code with the `mcp-dap-server` skills configured, invoke the app
 - `/debug-attach` — live process attach workflow
 - `/debug-core-dump` — post-mortem core dump analysis
 - `/debug-binary` — assembly-level binary debugging
+- `/debug-remote` — debugging a Go binary in a remote container via a remote `dlv dap` server
 
 Skills are located in `skills/` and provide the same workflow guidance with additional AI-specific decision trees and interpretation hints.
