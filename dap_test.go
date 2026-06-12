@@ -5,9 +5,71 @@ import (
 	"bytes"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/google/go-dap"
 )
+
+// TestReaderDrainsBurstWithoutConsumer reproduces the burst deadlock. dlv emits
+// a burst of messages on every stop (proportional to the number of goroutines).
+// The background reader must drain them off the socket immediately even with no
+// active consumer; otherwise the peer's writes block on a full socket buffer,
+// which in turn deadlocks our own next write (observed in the field as a write
+// i/o timeout on the first request after a stop in a busy process).
+func TestReaderDrainsBurstWithoutConsumer(t *testing.T) {
+	clientReader, serverWriter := io.Pipe() // server writes -> client reads
+	_, clientWriter := io.Pipe()            // client write side (unused here)
+
+	client := newDAPClientFromRWC(&readWriteCloser{
+		Reader:      clientReader,
+		WriteCloser: clientWriter,
+	})
+	defer client.Close()
+	defer serverWriter.Close() // unblock the background reader at teardown
+
+	// Far more than the previous fixed buffer (16). io.Pipe is synchronous, so
+	// each write blocks until the reader consumes it.
+	const burst = 64
+	writeDone := make(chan error, 1)
+	go func() {
+		for i := 0; i < burst; i++ {
+			ev := &dap.OutputEvent{
+				Event: dap.Event{
+					ProtocolMessage: dap.ProtocolMessage{Seq: i, Type: "event"},
+					Event:           "output",
+				},
+				Body: dap.OutputEventBody{Category: "stdout", Output: "x\n"},
+			}
+			if err := dap.WriteProtocolMessage(serverWriter, ev); err != nil {
+				writeDone <- err
+				return
+			}
+		}
+		writeDone <- nil
+	}()
+
+	// With an unbounded reader the writer completes the whole burst; with a
+	// bounded buffer and no consumer it blocks partway and never finishes.
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("server write failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("server writer blocked: reader did not drain the burst without a consumer")
+	}
+
+	// Every buffered message must still be retrievable in order.
+	for got := 0; got < burst; got++ {
+		msg, err := client.ReadMessageWithTimeout(2 * time.Second)
+		if err != nil {
+			t.Fatalf("ReadMessage %d/%d: %v", got, burst, err)
+		}
+		if _, ok := msg.(*dap.OutputEvent); !ok {
+			t.Fatalf("message %d: expected *dap.OutputEvent, got %T", got, msg)
+		}
+	}
+}
 
 func TestNewDAPClientFromRWC(t *testing.T) {
 	// Create a pipe to simulate a bidirectional connection

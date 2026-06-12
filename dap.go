@@ -39,10 +39,16 @@ type DAPClient struct {
 	logMu     sync.Mutex
 	logWriter io.Writer
 
-	// recvCh carries complete messages from the background reader (readLoop)
-	// to callers. Decoupling the blocking read from callers lets them apply a
-	// timeout without ever interrupting a read mid-message.
-	recvCh chan readResult
+	// The background reader (readLoop) appends every message it reads to an
+	// unbounded queue and signals notify. It must never block handing a message
+	// off, so the socket is drained the instant data arrives: if the reader
+	// stalled (as a bounded channel would once full), the peer's writes would
+	// block on a full socket buffer, and that in turn deadlocks our own next
+	// write. dlv emits a burst of messages on every stop (proportional to the
+	// number of goroutines), so this backlog is real, not theoretical.
+	queueMu sync.Mutex
+	queue   []readResult
+	notify  chan struct{} // buffered(1); signals the queue became non-empty
 }
 
 // readResult is a single decoded message or the error that ended the stream.
@@ -75,14 +81,14 @@ func newDAPClientFromRWC(rwc io.ReadWriteCloser) *DAPClient {
 		rwc:    rwc,
 		reader: bufio.NewReader(rwc),
 		seq:    1, // match VS Code numbering
-		recvCh: make(chan readResult, 16),
+		notify: make(chan struct{}, 1),
 	}
 	go c.readLoop()
 	return c
 }
 
 // Close closes the client connection. This unblocks the background reader,
-// which exits once the failed read surfaces on recvCh.
+// which appends the resulting read error to the queue and exits.
 func (c *DAPClient) Close() {
 	c.rwc.Close()
 }
@@ -94,11 +100,11 @@ func (c *DAPClient) SetProtocolLogger(w io.Writer) {
 	c.logMu.Unlock()
 }
 
-// readLoop reads complete DAP messages off the wire and forwards them on
-// recvCh. Running the blocking read in its own goroutine lets callers apply a
-// timeout (see ReadMessageWithTimeout) without interrupting a read
-// mid-message, which would desynchronize the stream. It exits after the first
-// read error (e.g. once Close shuts the transport down).
+// readLoop reads complete DAP messages off the wire and appends them to the
+// unbounded queue, never blocking on a slow consumer. Running the blocking read
+// in its own goroutine lets callers apply a timeout (see ReadMessageWithTimeout)
+// without interrupting a read mid-message, which would desynchronize the stream.
+// It exits after the first read error (e.g. once Close shuts the transport down).
 func (c *DAPClient) readLoop() {
 	for {
 		msg, err := dap.ReadProtocolMessage(c.reader)
@@ -112,11 +118,42 @@ func (c *DAPClient) readLoop() {
 				}
 			}
 		}
-		c.recvCh <- readResult{msg: msg, err: err}
+		c.enqueue(readResult{msg: msg, err: err})
 		if err != nil {
 			return
 		}
 	}
+}
+
+// enqueue appends a read result and wakes a waiting reader. The notify channel
+// is buffered to 1 and the send is non-blocking, so a backlog of appends
+// coalesces into a single pending signal; every reader re-checks the queue
+// after each wake, so a coalesced signal never loses a message.
+func (c *DAPClient) enqueue(r readResult) {
+	c.queueMu.Lock()
+	c.queue = append(c.queue, r)
+	c.queueMu.Unlock()
+	select {
+	case c.notify <- struct{}{}:
+	default:
+	}
+}
+
+// dequeue removes and returns the front of the queue, or ok=false if empty.
+func (c *DAPClient) dequeue() (readResult, bool) {
+	c.queueMu.Lock()
+	defer c.queueMu.Unlock()
+	if len(c.queue) == 0 {
+		return readResult{}, false
+	}
+	r := c.queue[0]
+	if len(c.queue) == 1 {
+		c.queue = nil // release the backing array once drained
+	} else {
+		c.queue[0] = readResult{}
+		c.queue = c.queue[1:]
+	}
+	return r, true
 }
 
 // InitializeRequest sends an 'initialize' request and returns the server's capabilities.
@@ -163,8 +200,12 @@ func (c *DAPClient) InitializeRequest(adapterID string) (dap.Capabilities, error
 // ReadMessage returns the next DAP message, blocking until one is available
 // or the stream ends.
 func (c *DAPClient) ReadMessage() (dap.Message, error) {
-	r := <-c.recvCh
-	return r.msg, r.err
+	for {
+		if r, ok := c.dequeue(); ok {
+			return r.msg, r.err
+		}
+		<-c.notify
+	}
 }
 
 // ReadMessageWithTimeout returns the next DAP message, or errReadTimeout if
@@ -174,21 +215,23 @@ func (c *DAPClient) ReadMessage() (dap.Message, error) {
 // message is immediately available. It therefore never blocks indefinitely,
 // even when a caller computes a remaining duration that has gone negative.
 func (c *DAPClient) ReadMessageWithTimeout(d time.Duration) (dap.Message, error) {
+	if r, ok := c.dequeue(); ok {
+		return r.msg, r.err
+	}
 	if d <= 0 {
-		select {
-		case r := <-c.recvCh:
-			return r.msg, r.err
-		default:
-			return nil, errReadTimeout
-		}
+		return nil, errReadTimeout
 	}
 	t := time.NewTimer(d)
 	defer t.Stop()
-	select {
-	case r := <-c.recvCh:
-		return r.msg, r.err
-	case <-t.C:
-		return nil, errReadTimeout
+	for {
+		select {
+		case <-c.notify:
+			if r, ok := c.dequeue(); ok {
+				return r.msg, r.err
+			}
+		case <-t.C:
+			return nil, errReadTimeout
+		}
 	}
 }
 
