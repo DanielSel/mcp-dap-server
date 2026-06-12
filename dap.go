@@ -417,6 +417,13 @@ func (c *DAPClient) VariablesRequest(variablesReference int) (int, error) {
 // because go-dap uses omitempty on FrameId, which drops frameId=0 from the
 // wire. GDB's native DAP uses 0-based frame IDs, so omitting frameId=0
 // causes evaluation in global scope where local variables aren't visible.
+//
+// The hand-built message is still sent through send() so it refreshes the
+// write deadline like every other request. Writing it directly once left the
+// deadline from a prior send() in place: a long-running write deadline is
+// absolute, so an evaluate issued more than writeTimeout after the previous
+// request inherited an already-elapsed deadline and failed instantly with a
+// "write tcp ...: i/o timeout". See send / writeTimeout.
 func (c *DAPClient) EvaluateRequest(expression string, frameID int, context string) (int, error) {
 	req := c.newRequest("evaluate")
 	args := map[string]any{
@@ -430,12 +437,7 @@ func (c *DAPClient) EvaluateRequest(expression string, frameID int, context stri
 		dap.Request
 		Arguments map[string]any `json:"arguments"`
 	}{Request: *req, Arguments: args}
-	if c.logWriter != nil {
-		if data, err := json.Marshal(&msg); err == nil {
-			fmt.Fprintf(c.logWriter, "SENT: <<<%s>>>\n", data)
-		}
-	}
-	return req.Seq, dap.WriteProtocolMessage(c.rwc, &msg)
+	return req.Seq, c.send(&msg)
 }
 
 // DisconnectRequest sends a 'disconnect' request.

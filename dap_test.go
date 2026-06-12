@@ -4,11 +4,59 @@ import (
 	"bufio"
 	"bytes"
 	"io"
+	"net"
 	"testing"
 	"time"
 
 	"github.com/google/go-dap"
 )
+
+// TestEvaluateRefreshesWriteDeadline reproduces the evaluate write deadlock.
+// SetWriteDeadline sets an absolute time that stays on the connection until the
+// next write resets it, so every request must refresh it. evaluate once wrote
+// directly, bypassing send()'s refresh, and inherited the deadline of whatever
+// request ran before it. When more than writeTimeout elapsed since that request
+// (the agent pausing to reason before a large evaluate), the inherited deadline
+// had already passed and the evaluate write failed instantly with
+// "write tcp ...: i/o timeout" — while quick successive small evals slipped in
+// under the still-valid previous deadline, making it look size-correlated.
+//
+// A real TCP loopback is required: SetWriteDeadline is a no-op on the io.Pipe
+// transport used elsewhere in these tests.
+func TestEvaluateRefreshesWriteDeadline(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	// Drain the server side so nothing but the deadline can fail the write.
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		io.Copy(io.Discard, conn)
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	client := newDAPClientFromRWC(conn)
+	defer client.Close()
+
+	// Simulate an earlier request whose write deadline has already elapsed.
+	if err := conn.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("set stale deadline: %v", err)
+	}
+
+	// evaluate must set its own fresh deadline; otherwise this write fails
+	// immediately with an i/o timeout.
+	if _, err := client.EvaluateRequest("string(body)", 1000, "watch"); err != nil {
+		t.Fatalf("EvaluateRequest must refresh the write deadline, got: %v", err)
+	}
+}
 
 // TestReaderDrainsBurstWithoutConsumer reproduces the burst deadlock. dlv emits
 // a burst of messages on every stop (proportional to the number of goroutines).
